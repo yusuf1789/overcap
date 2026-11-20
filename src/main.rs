@@ -2,6 +2,7 @@ mod capture;
 mod config;
 mod ocr;
 mod overlay;
+mod profiles;
 mod selector;
 mod settings_ui;
 mod translator;
@@ -23,7 +24,10 @@ use crate::ocr::{SourceBounds, WinOcr};
 use crate::overlay::{create_handle, open_settings_in_browser, run_overlay_loop, OverlayHandle};
 use crate::selector::select_region;
 use crate::settings_ui::start_settings_server;
-use crate::translator::{is_same_subtitle, GeminiTranslator, GoogleTranslator, GroqTranslator, Translator};
+use crate::translator::{
+    is_same_subtitle, GeminiTranslator, GoogleTranslator, GroqTranslator, OpenAiCompatTranslator,
+    Translator,
+};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -35,7 +39,7 @@ struct Args {
     #[arg(long)]
     select: bool,
 
-    /// Translation engine: google, gemini, or groq
+    /// Translation engine: google, gemini, groq, or openai-compat
     #[arg(long)]
     engine: Option<String>,
 
@@ -54,6 +58,22 @@ struct Args {
     /// Groq model (default: qwen/qwen3.8-27b)
     #[arg(long)]
     groq_model: Option<String>,
+
+    /// OpenAI-compatible base URL (e.g. http://127.0.0.1:11434/v1)
+    #[arg(long)]
+    custom_base_url: Option<String>,
+
+    /// OpenAI-compatible API key (optional for local servers like Ollama)
+    #[arg(long)]
+    custom_key: Option<String>,
+
+    /// OpenAI-compatible model (default: qwen2.5:7b)
+    #[arg(long)]
+    custom_model: Option<String>,
+
+    /// Disable automatic per-app subtitle region switching
+    #[arg(long)]
+    no_auto_profiles: bool,
 
     /// Source language code (e.g. en, de, fr, ja)
     #[arg(long)]
@@ -144,6 +164,9 @@ fn translation_worker(
     gemini_model: String,
     groq_key: Option<String>,
     groq_model: String,
+    custom_base_url: String,
+    custom_key: Option<String>,
+    custom_model: String,
     source_lang: String,
     target_lang: String,
 ) {
@@ -212,6 +235,40 @@ fn translation_worker(
                     eprintln!("[Translation ERROR] {e}");
                     handle.stop_flag.store(true, Ordering::SeqCst);
                     return;
+                }
+            }
+        }
+    } else if engine_name.eq_ignore_ascii_case("openai-compat")
+        || engine_name.eq_ignore_ascii_case("custom")
+        || engine_name.eq_ignore_ascii_case("ollama")
+    {
+        let api_key = custom_key
+            .filter(|k| !k.trim().is_empty())
+            .or_else(|| std::env::var("OPENAI_API_KEY").ok().filter(|k| !k.trim().is_empty()));
+
+        match OpenAiCompatTranslator::new(
+            custom_base_url.clone(),
+            api_key,
+            custom_model.clone(),
+            &source_lang,
+            &target_lang,
+        ) {
+            Ok(t) => {
+                println!(
+                    "[Ready] OpenAI-compat endpoint: {} (model: {})",
+                    custom_base_url, custom_model
+                );
+                Box::new(t)
+            }
+            Err(e) => {
+                eprintln!("[OpenAI-compat ERROR] {e} -> falling back to Google");
+                match GoogleTranslator::new(&source_lang, &target_lang) {
+                    Ok(g) => Box::new(g),
+                    Err(ge) => {
+                        eprintln!("[Translation ERROR] {ge}");
+                        handle.stop_flag.store(true, Ordering::SeqCst);
+                        return;
+                    }
                 }
             }
         }
@@ -308,8 +365,30 @@ fn ocr_worker(
     let mut prev_bgra: Option<Vec<u8>> = None;
     let mut last_src = String::new();
     let mut empty_streak: u32 = 0;
+    let mut last_profile_check = Instant::now() - Duration::from_secs(1);
+    let mut last_fg_app: Option<String> = None;
 
     while !handle.stop_flag.load(Ordering::SeqCst) {
+        if last_profile_check.elapsed() >= Duration::from_millis(500) {
+            last_profile_check = Instant::now();
+            let fg_app = profiles::foreground_process_name();
+            if fg_app != last_fg_app {
+                last_fg_app = fg_app.clone();
+                handle.set_active_app(fg_app.clone());
+                if let Some(ref app) = fg_app {
+                    let cfg_snap = handle.snapshot_config();
+                    if cfg_snap.auto_profiles {
+                        if let Some(&prof_region) = cfg_snap.profiles.get(app) {
+                            if handle.current_region() != prof_region {
+                                println!("[Profile] Switched region for {} -> {:?}", app, prof_region);
+                                handle.set_region_from_profile(prof_region);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         if handle.is_paused() {
             thread::sleep(Duration::from_millis(150));
             continue;
@@ -423,6 +502,22 @@ fn main() -> Result<()> {
         cfg.groq_model = model;
         cfg_dirty = true;
     }
+    if let Some(url) = args.custom_base_url {
+        cfg.custom_base_url = url;
+        cfg_dirty = true;
+    }
+    if let Some(key) = args.custom_key {
+        cfg.custom_api_key = Some(key);
+        cfg_dirty = true;
+    }
+    if let Some(model) = args.custom_model {
+        cfg.custom_model = model;
+        cfg_dirty = true;
+    }
+    if args.no_auto_profiles {
+        cfg.auto_profiles = false;
+        cfg_dirty = true;
+    }
     if let Some(from) = args.from {
         cfg.source_lang = from;
         cfg_dirty = true;
@@ -480,6 +575,9 @@ fn main() -> Result<()> {
     let gemini_model = cfg.gemini_model.clone();
     let groq_key = cfg.groq_api_key.clone();
     let groq_model = cfg.groq_model.clone();
+    let custom_base_url = cfg.custom_base_url.clone();
+    let custom_key = cfg.custom_api_key.clone();
+    let custom_model = cfg.custom_model.clone();
     let handle = create_handle(cfg, region, args.settings_port);
     let slot = Arc::new(TranslationSlot::new());
     let latest_seq = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -507,6 +605,9 @@ fn main() -> Result<()> {
             gemini_model,
             groq_key,
             groq_model,
+            custom_base_url,
+            custom_key,
+            custom_model,
             tx_src,
             tx_dst,
         );

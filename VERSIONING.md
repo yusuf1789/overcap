@@ -14,6 +14,12 @@ The canonical version number is maintained in `package.version` inside [Cargo.to
 
 ## Changelog
 
+### `v0.2.0` — OpenAI-Compatible Endpoints, Auto App Profiles & OCR Diagnostics
+- Added `OpenAiCompatTranslator` (`--engine openai-compat`, also accepts `custom` / `ollama` aliases) for local LLMs (Ollama, LM Studio, vLLM) and custom OpenAI-compatible `/chat/completions` endpoints via `--custom-base-url`, `--custom-model`, and `--custom-key`.
+- Added automatic per-app subtitle region profiles (`src/profiles.rs`): `Ctrl + Shift + S` binds the selected region to the active foreground `.exe`, and `ocr_worker` automatically switches regions when switching between apps/games without stealing focus (disable with `--no-auto-profiles` or in Settings UI).
+- Added Windows OCR language diagnostics (`available_ocr_languages`, `is_language_installed`) to the Settings UI with a missing-language warning and a direct `Open Windows Language Settings` action (`ms-settings:regionlanguage`).
+- Extended `AppConfig` (`config.json`) with backward-compatible defaults (`custom_base_url`, `custom_api_key`, `custom_model`, `auto_profiles`, `profiles`).
+
 ### `v0.1.0` — Initial Release
 - Single-binary Rust + Win32 architecture (`overcap.exe`).
 - `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)` and click-through (`WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW`) overlay window.

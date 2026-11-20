@@ -22,5 +22,10 @@
   "gemini_api_key": "",
   "gemini_model": "gemini-3.1-flash-lite",
   "groq_api_key": "",
-  "groq_model": "qwen/qwen3.8-27b"
+  "groq_model": "qwen/qwen3.8-27b",
+  "custom_base_url": "http://127.0.0.1:11434/v1",
+  "custom_api_key": "",
+  "custom_model": "qwen2.5:7b",
+  "auto_profiles": true,
+  "profiles": {}
 }

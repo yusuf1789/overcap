@@ -26,10 +26,13 @@ Works game-independently with PC games (Borderless Windowed), console streaming/
 - **Pluggable Translation Backends (`Translator` trait):**
   - **Groq (`qwen/qwen3.8-27b`, recommended):** `~150-280 ms` end-to-end latency with context-aware, colloquial game/video translation (`reasoning_effort: "none"`).
   - **Google Gemini (`gemini-3.1-flash-lite`):** Context-aware translation with OCR glitch correction.
+  - **OpenAI-Compatible / Local LLMs (`openai-compat` / `ollama`):** Connect to Ollama, LM Studio, vLLM, or any `/chat/completions` endpoint (`--custom-base-url`, `--custom-model`, `--custom-key`).
   - **Google Translate:** Keyless free default and automatic fallback on API errors.
+- **Automatic Per-App Profiles:**
+  - `Ctrl + Shift + S` saves the selected subtitle region to the active `.exe` profile, and Overcap automatically switches regions when you switch games or video players (disable with `--no-auto-profiles` or in Settings UI).
 - **Built-In Live Settings UI (`127.0.0.1:8787`):**
   - Open in browser anytime with `Ctrl + Shift + A`.
-  - Configure Font Family, Font Size, Bold, Text Color, Text Shadow, Background Color, Opacity, Border Radius, Padding X/Y, Auto-Fit Container, Engine, and Languages with live preview and automatic saving to `config.json`.
+  - Configure Font Family, Font Size, Bold, Text Color, Text Shadow, Background Color, Opacity, Border Radius, Padding X/Y, Auto-Fit Container, Engine, Languages, **OCR Diagnostics** (installed Windows OCR language check), and **App Profiles** with live preview and automatic saving to `config.json`.
 - **High-DPI & Multi-Monitor Ready:** Uses `DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2` for 1:1 coordinate accuracy across `%125` / `%150` Windows display scaling.
 
 ---

@@ -1,9 +1,13 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::process::Command;
 use std::sync::atomic::Ordering;
 use std::thread;
 
+use crate::config::Region;
+use crate::ocr::{available_ocr_languages, is_language_installed};
 use crate::overlay::{OverlayHandle, OverlayStyle};
 
 #[derive(Serialize)]
@@ -24,8 +28,16 @@ struct PublicConfig {
     engine: String,
     gemini_model: String,
     groq_model: String,
+    custom_base_url: String,
+    custom_model: String,
     has_gemini_key: bool,
     has_groq_key: bool,
+    has_custom_key: bool,
+    auto_profiles: bool,
+    active_app: Option<String>,
+    profiles: HashMap<String, Region>,
+    installed_ocr_langs: Vec<String>,
+    source_ocr_installed: bool,
 }
 
 #[derive(Deserialize)]
@@ -58,6 +70,19 @@ struct StyleUpdatePayload {
     gemini_api_key: Option<String>,
     #[serde(default)]
     groq_api_key: Option<String>,
+    #[serde(default)]
+    custom_base_url: Option<String>,
+    #[serde(default)]
+    custom_model: Option<String>,
+    #[serde(default)]
+    custom_api_key: Option<String>,
+    #[serde(default)]
+    auto_profiles: Option<bool>,
+}
+
+#[derive(Deserialize)]
+struct DeleteProfilePayload {
+    app: String,
 }
 
 fn default_true() -> bool {
@@ -174,6 +199,9 @@ fn handle_client(mut stream: TcpStream, handle: OverlayHandle) {
         }
         ("GET", "/api/config") => {
             let cfg = handle.snapshot_config();
+            let active_app = handle.active_app();
+            let installed_ocr_langs = available_ocr_languages();
+            let source_ocr_installed = is_language_installed(&cfg.source_lang);
             let pub_cfg = PublicConfig {
                 font_family: cfg.font_family,
                 font_size: cfg.font_size,
@@ -191,6 +219,8 @@ fn handle_client(mut stream: TcpStream, handle: OverlayHandle) {
                 engine: cfg.engine,
                 gemini_model: cfg.gemini_model,
                 groq_model: cfg.groq_model,
+                custom_base_url: cfg.custom_base_url,
+                custom_model: cfg.custom_model,
                 has_gemini_key: cfg
                     .gemini_api_key
                     .as_deref()
@@ -201,6 +231,16 @@ fn handle_client(mut stream: TcpStream, handle: OverlayHandle) {
                     .as_deref()
                     .map(|s| !s.trim().is_empty())
                     .unwrap_or(false),
+                has_custom_key: cfg
+                    .custom_api_key
+                    .as_deref()
+                    .map(|s| !s.trim().is_empty())
+                    .unwrap_or(false),
+                auto_profiles: cfg.auto_profiles,
+                active_app,
+                profiles: cfg.profiles,
+                installed_ocr_langs,
+                source_ocr_installed,
             };
             let json = serde_json::to_string(&pub_cfg).unwrap_or_else(|_| "{}".to_string());
             write_response(&mut stream, "200 OK", "application/json; charset=utf-8", &json);
@@ -262,6 +302,18 @@ fn handle_client(mut stream: TcpStream, handle: OverlayHandle) {
                 if let Some(qk) = p.groq_api_key.filter(|s| !s.trim().is_empty()) {
                     cfg.groq_api_key = Some(qk.trim().to_string());
                 }
+                if let Some(url) = p.custom_base_url.filter(|s| !s.trim().is_empty()) {
+                    cfg.custom_base_url = url.trim().to_string();
+                }
+                if let Some(cm) = p.custom_model.filter(|s| !s.trim().is_empty()) {
+                    cfg.custom_model = cm.trim().to_string();
+                }
+                if let Some(ck) = p.custom_api_key.filter(|s| !s.trim().is_empty()) {
+                    cfg.custom_api_key = Some(ck.trim().to_string());
+                }
+                if let Some(ap) = p.auto_profiles {
+                    cfg.auto_profiles = ap;
+                }
 
                 match handle.update_config_and_save(cfg) {
                     Ok(_) => write_response(&mut stream, "200 OK", "application/json", "{\"ok\":true}"),
@@ -291,6 +343,30 @@ fn handle_client(mut stream: TcpStream, handle: OverlayHandle) {
             } else {
                 write_response(&mut stream, "400 Bad Request", "application/json", "{\"ok\":false}");
             }
+        }
+        ("POST", "/api/delete-profile") => {
+            if let Ok(p) = serde_json::from_str::<DeleteProfilePayload>(&body) {
+                let mut cfg = handle.snapshot_config();
+                let key = p.app.trim().to_lowercase();
+                cfg.profiles.remove(&key);
+                match handle.update_config_and_save(cfg) {
+                    Ok(_) => write_response(&mut stream, "200 OK", "application/json", "{\"ok\":true}"),
+                    Err(e) => write_response(
+                        &mut stream,
+                        "500 Internal Server Error",
+                        "application/json",
+                        &format!("{{\"ok\":false,\"error\":\"{}\"}}", e),
+                    ),
+                }
+            } else {
+                write_response(&mut stream, "400 Bad Request", "application/json", "{\"ok\":false}");
+            }
+        }
+        ("POST", "/api/open-lang-settings") => {
+            let _ = Command::new("cmd")
+                .args(["/C", "start", "", "ms-settings:regionlanguage"])
+                .spawn();
+            write_response(&mut stream, "200 OK", "application/json", "{\"ok\":true}");
         }
         _ => {
             write_response(&mut stream, "404 Not Found", "text/plain", "Not Found");
@@ -538,6 +614,54 @@ const SETTINGS_HTML: &str = r##"<!DOCTYPE html>
     color: #ffffff;
     border-color: var(--btn-dark);
   }
+  .diag-box {
+    border: 1px solid var(--border);
+    background: var(--input-bg);
+    border-radius: 4px;
+    padding: 8px 10px;
+    font-size: 12px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+  }
+  .diag-warn {
+    border-color: #8c6d1f;
+    background: #f5f2e8;
+    color: #4a3b10;
+  }
+  .diag-tags {
+    font-family: Consolas, monospace;
+    font-size: 11px;
+    color: var(--text);
+  }
+  .btn-sm {
+    padding: 4px 10px;
+    font-size: 11px;
+  }
+  .profile-list {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin-top: 8px;
+  }
+  .profile-item {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    background: var(--input-bg);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 6px 10px;
+    font-size: 12px;
+    gap: 8px;
+  }
+  .profile-meta {
+    font-family: Consolas, monospace;
+    font-size: 11px;
+    color: var(--muted);
+  }
 </style>
 </head>
 <body>
@@ -669,6 +793,7 @@ const SETTINGS_HTML: &str = r##"<!DOCTYPE html>
             <option value="groq">groq</option>
             <option value="gemini">gemini</option>
             <option value="google">google</option>
+            <option value="openai-compat">openai-compat</option>
           </select>
         </div>
         <div class="field">
@@ -697,7 +822,51 @@ const SETTINGS_HTML: &str = r##"<!DOCTYPE html>
           <input type="password" id="gemini_api_key" placeholder="Leave blank to keep existing">
         </div>
       </div>
+      <div class="grid" style="margin-top: 10px; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));">
+        <div class="field">
+          <label id="ui_custom_url_lbl">Custom Base URL</label>
+          <input type="text" id="custom_base_url" value="http://127.0.0.1:11434/v1">
+        </div>
+        <div class="field">
+          <label id="ui_custom_model_lbl">Custom Model</label>
+          <input type="text" id="custom_model" value="qwen2.5:7b">
+        </div>
+        <div class="field">
+          <label><span id="ui_custom_key_lbl">Custom API Key</span> <span class="val" id="custom_key_status"></span></label>
+          <input type="password" id="custom_api_key" placeholder="Leave blank to keep existing">
+        </div>
+      </div>
       <div class="hint" id="ui_engine_hint">Style updates live. Engine/model/lang changes apply on restart.</div>
+    </div>
+
+    <div class="card">
+      <h2 id="ui_card_ocr">OCR Diagnostics</h2>
+      <div class="field">
+        <label id="ui_ocr_langs_lbl">Installed Windows OCR Languages</label>
+        <div class="diag-box">
+          <span class="diag-tags" id="ocr_langs_list">-</span>
+        </div>
+      </div>
+      <div class="field" id="ocr_warn_box" style="display: none;">
+        <div class="diag-box diag-warn">
+          <span id="ui_ocr_warn_text">Source OCR language pack is not installed in Windows.</span>
+          <button class="btn btn-secondary btn-sm" id="ui_open_lang_btn" onclick="openLangSettings()">Open Windows Language Settings</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2 id="ui_card_profiles">App Profiles</h2>
+      <div class="field">
+        <label><span id="ui_active_app_lbl">Active App</span> <span class="val" id="active_app_val">None</span></label>
+      </div>
+      <div class="toggle-row" style="margin-bottom: 8px;">
+        <label class="toggle-label"><input type="checkbox" id="auto_profiles" checked> <span id="ui_auto_profiles_lbl">Auto-Switch by App</span></label>
+      </div>
+      <div class="field">
+        <label id="ui_saved_profiles_lbl">Saved App Regions (Ctrl + Shift + S)</label>
+        <div class="profile-list" id="profiles_list"></div>
+      </div>
     </div>
   </div>
 
@@ -730,6 +899,21 @@ const SETTINGS_HTML: &str = r##"<!DOCTYPE html>
       keyPlaceholder: 'Leave blank to keep existing',
       keySet: 'SET',
       keyEmpty: 'EMPTY',
+      customUrlLbl: 'Custom Base URL',
+      customModelLbl: 'Custom Model',
+      customKeyLbl: 'Custom API Key',
+      cardOcr: 'OCR Diagnostics',
+      ocrLangsLbl: 'Installed Windows OCR Languages',
+      ocrNone: 'None detected',
+      ocrWarn: 'Source OCR language pack is not installed in Windows.',
+      openLangBtn: 'Open Windows Language Settings',
+      cardProfiles: 'App Profiles',
+      activeAppLbl: 'Active App',
+      activeAppNone: 'None',
+      autoProfilesLbl: 'Auto-Switch by App',
+      savedProfilesLbl: 'Saved App Regions (Ctrl + Shift + S)',
+      profilesEmpty: 'No app profiles saved yet.',
+      removeBtn: 'Remove',
       engineHint: 'Style updates live. Engine/model/lang changes apply on restart.',
       saveBtn: 'Save config.json',
       toastAutoSaved: 'Auto-saved (config.json)',
@@ -763,6 +947,21 @@ const SETTINGS_HTML: &str = r##"<!DOCTYPE html>
       keyPlaceholder: 'Mevcut anahtarı korumak için boş bırakın',
       keySet: 'KAYITLI',
       keyEmpty: 'BOŞ',
+      customUrlLbl: 'Özel Base URL',
+      customModelLbl: 'Özel Model',
+      customKeyLbl: 'Özel API Anahtarı',
+      cardOcr: 'OCR Tanılama',
+      ocrLangsLbl: 'Kurulu Windows OCR Dilleri',
+      ocrNone: 'Bulunamadı',
+      ocrWarn: 'Kaynak OCR dil paketi Windows üzerinde kurulu değil.',
+      openLangBtn: 'Windows Dil Ayarlarını Aç',
+      cardProfiles: 'Uygulama Profilleri',
+      activeAppLbl: 'Aktif Uygulama',
+      activeAppNone: 'Yok',
+      autoProfilesLbl: 'Uygulamaya Göre Otomatik Değiştir',
+      savedProfilesLbl: 'Kayıtlı Uygulama Bölgeleri (Ctrl + Shift + S)',
+      profilesEmpty: 'Henüz kayıtlı uygulama profili yok.',
+      removeBtn: 'Kaldır',
       engineHint: 'Stil ayarları anlık güncellenir. Motor/model/dil değişiklikleri yeniden başlatmada geçerli olur.',
       saveBtn: 'config.json Kaydet',
       toastAutoSaved: 'Otomatik kaydedildi (config.json)',
@@ -783,6 +982,8 @@ const SETTINGS_HTML: &str = r##"<!DOCTYPE html>
   let previewTimer = null;
   let hasGroqKey = false;
   let hasGeminiKey = false;
+  let hasCustomKey = false;
+  let lastConfigData = null;
 
   function currentSamples() {
     return i18n[uiLang].samples;
@@ -812,9 +1013,25 @@ const SETTINGS_HTML: &str = r##"<!DOCTYPE html>
     document.getElementById('ui_lang_lbl').textContent = t.langLbl;
     document.getElementById('groq_api_key').placeholder = t.keyPlaceholder;
     document.getElementById('gemini_api_key').placeholder = t.keyPlaceholder;
+    document.getElementById('custom_api_key').placeholder = t.keyPlaceholder;
     document.getElementById('groq_key_status').textContent = hasGroqKey ? t.keySet : t.keyEmpty;
     document.getElementById('gemini_key_status').textContent = hasGeminiKey ? t.keySet : t.keyEmpty;
+    document.getElementById('custom_key_status').textContent = hasCustomKey ? t.keySet : t.keyEmpty;
+    document.getElementById('ui_custom_url_lbl').textContent = t.customUrlLbl;
+    document.getElementById('ui_custom_model_lbl').textContent = t.customModelLbl;
+    document.getElementById('ui_custom_key_lbl').textContent = t.customKeyLbl;
+    document.getElementById('ui_card_ocr').textContent = t.cardOcr;
+    document.getElementById('ui_ocr_langs_lbl').textContent = t.ocrLangsLbl;
+    document.getElementById('ui_ocr_warn_text').textContent = t.ocrWarn;
+    document.getElementById('ui_open_lang_btn').textContent = t.openLangBtn;
+    document.getElementById('ui_card_profiles').textContent = t.cardProfiles;
+    document.getElementById('ui_active_app_lbl').textContent = t.activeAppLbl;
+    document.getElementById('ui_auto_profiles_lbl').textContent = t.autoProfilesLbl;
+    document.getElementById('ui_saved_profiles_lbl').textContent = t.savedProfilesLbl;
     document.getElementById('ui_engine_hint').textContent = t.engineHint;
+    if (lastConfigData) {
+      renderDiagnosticsAndProfiles(lastConfigData);
+    }
     document.getElementById('ui_save_btn').textContent = t.saveBtn;
     document.getElementById('toast').textContent = t.toastDefault;
 
@@ -972,10 +1189,14 @@ const SETTINGS_HTML: &str = r##"<!DOCTYPE html>
       engine: document.getElementById('engine').value,
       groq_model: document.getElementById('groq_model').value,
       gemini_model: document.getElementById('gemini_model').value,
+      custom_base_url: document.getElementById('custom_base_url').value,
+      custom_model: document.getElementById('custom_model').value,
       source_lang: document.getElementById('source_lang').value,
       target_lang: document.getElementById('target_lang').value,
       groq_api_key: document.getElementById('groq_api_key').value || null,
-      gemini_api_key: document.getElementById('gemini_api_key').value || null
+      gemini_api_key: document.getElementById('gemini_api_key').value || null,
+      custom_api_key: document.getElementById('custom_api_key').value || null,
+      auto_profiles: document.getElementById('auto_profiles').checked
     };
     const r = await fetch('/api/save', {
       method: 'POST',
@@ -988,14 +1209,71 @@ const SETTINGS_HTML: &str = r##"<!DOCTYPE html>
       toast.style.opacity = '1';
       document.getElementById('groq_api_key').value = '';
       document.getElementById('gemini_api_key').value = '';
+      document.getElementById('custom_api_key').value = '';
       setTimeout(() => { toast.style.opacity = '0'; }, 2500);
       loadConfig();
+    }
+  }
+
+  async function openLangSettings() {
+    await fetch('/api/open-lang-settings', { method: 'POST' });
+  }
+
+  async function deleteProfile(app) {
+    const r = await fetch('/api/delete-profile', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ app })
+    });
+    if (r.ok) {
+      loadConfig();
+    }
+  }
+
+  function renderDiagnosticsAndProfiles(c) {
+    const t = i18n[uiLang];
+    const langs = Array.isArray(c.installed_ocr_langs) ? c.installed_ocr_langs : [];
+    document.getElementById('ocr_langs_list').textContent = langs.length > 0 ? langs.join(', ') : t.ocrNone;
+    document.getElementById('ocr_warn_box').style.display = c.source_ocr_installed === false ? 'block' : 'none';
+    document.getElementById('active_app_val').textContent = c.active_app || t.activeAppNone;
+
+    const listEl = document.getElementById('profiles_list');
+    listEl.innerHTML = '';
+    const entries = Object.entries(c.profiles || {}).sort((a, b) => a[0].localeCompare(b[0]));
+    if (entries.length === 0) {
+      const empty = document.createElement('div');
+      empty.className = 'hint';
+      empty.textContent = t.profilesEmpty;
+      listEl.appendChild(empty);
+      return;
+    }
+    for (const [app, reg] of entries) {
+      const item = document.createElement('div');
+      item.className = 'profile-item';
+      const left = document.createElement('div');
+      const nameEl = document.createElement('strong');
+      nameEl.textContent = app;
+      const metaEl = document.createElement('span');
+      metaEl.className = 'profile-meta';
+      metaEl.textContent = `  (${reg.width}x${reg.height} @ ${reg.left},${reg.top})`;
+      left.appendChild(nameEl);
+      left.appendChild(metaEl);
+
+      const btn = document.createElement('button');
+      btn.className = 'btn btn-secondary btn-sm';
+      btn.textContent = t.removeBtn;
+      btn.onclick = () => deleteProfile(app);
+
+      item.appendChild(left);
+      item.appendChild(btn);
+      listEl.appendChild(item);
     }
   }
 
   async function loadConfig() {
     const r = await fetch('/api/config');
     const c = await r.json();
+    lastConfigData = c;
     document.getElementById('font_family').value = c.font_family || 'Segoe UI';
     document.getElementById('font_size').value = c.font_size || 28;
     document.getElementById('font_bold').checked = c.font_bold !== false;
@@ -1010,13 +1288,19 @@ const SETTINGS_HTML: &str = r##"<!DOCTYPE html>
     document.getElementById('engine').value = c.engine || 'google';
     document.getElementById('groq_model').value = c.groq_model || 'qwen/qwen3.8-27b';
     document.getElementById('gemini_model').value = c.gemini_model || 'gemini-3.1-flash-lite';
+    document.getElementById('custom_base_url').value = c.custom_base_url || 'http://127.0.0.1:11434/v1';
+    document.getElementById('custom_model').value = c.custom_model || 'qwen2.5:7b';
     document.getElementById('source_lang').value = c.source_lang || 'en';
     document.getElementById('target_lang').value = c.target_lang || 'tr';
+    document.getElementById('auto_profiles').checked = c.auto_profiles !== false;
     hasGroqKey = Boolean(c.has_groq_key);
     hasGeminiKey = Boolean(c.has_gemini_key);
+    hasCustomKey = Boolean(c.has_custom_key);
     const t = i18n[uiLang];
     document.getElementById('groq_key_status').textContent = hasGroqKey ? t.keySet : t.keyEmpty;
     document.getElementById('gemini_key_status').textContent = hasGeminiKey ? t.keySet : t.keyEmpty;
+    document.getElementById('custom_key_status').textContent = hasCustomKey ? t.keySet : t.keyEmpty;
+    renderDiagnosticsAndProfiles(c);
     renderLocalPreview(collectStyle());
   }
 

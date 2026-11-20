@@ -28,6 +28,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use crate::config::{parse_hex_colorref, AppConfig, Region};
 use crate::ocr::SourceBounds;
+use crate::profiles::foreground_process_name;
 use crate::selector::select_region;
 
 const WM_APP_UPDATE: u32 = WM_APP + 1;
@@ -79,6 +80,7 @@ pub struct SharedOverlayState {
     pub style: OverlayStyle,
     pub paused: bool,
     pub region: Region,
+    pub active_app: Option<String>,
     pub config: AppConfig,
     pub settings_port: u16,
 }
@@ -173,6 +175,34 @@ impl OverlayHandle {
         }
         self.post_msg(WM_APP_STYLE);
         Ok(())
+    }
+
+    pub fn set_active_app(&self, app: Option<String>) {
+        if let Ok(mut st) = self.state.lock() {
+            st.active_app = app;
+        }
+    }
+
+    pub fn active_app(&self) -> Option<String> {
+        self.state.lock().ok().and_then(|s| s.active_app.clone())
+    }
+
+    pub fn set_region_from_profile(&self, region: Region) {
+        let changed = if let Ok(mut st) = self.state.lock() {
+            if st.region == region {
+                false
+            } else {
+                st.region = region;
+                st.config.region = Some(region);
+                true
+            }
+        } else {
+            false
+        };
+        if changed {
+            self.region_changed.store(true, Ordering::SeqCst);
+            self.post_msg(WM_APP_STYLE);
+        }
     }
 }
 
@@ -369,6 +399,7 @@ unsafe extern "system" fn overlay_wnd_proc(
                     apply_visibility_and_redraw(hwnd);
                 }
                 HK_RESELECT => {
+                    let detected_app = foreground_process_name();
                     println!("[Hotkey] Ctrl+Shift+S -> Selecting new subtitle region...");
                     let _ = ShowWindow(hwnd, SW_HIDE);
                     if let Ok(Some(new_region)) = select_region() {
@@ -378,6 +409,11 @@ unsafe extern "system" fn overlay_wnd_proc(
                                 if let Ok(mut st) = h.state.lock() {
                                     st.region = new_region;
                                     st.config.region = Some(new_region);
+                                    if let Some(ref app) = detected_app {
+                                        st.active_app = Some(app.clone());
+                                        st.config.profiles.insert(app.clone(), new_region);
+                                        println!("[Profile] Saved region for {}", app);
+                                    }
                                     let _ = st.config.save();
                                 }
                                 h.region_changed.store(true, Ordering::SeqCst);
@@ -563,6 +599,7 @@ pub fn create_handle(config: AppConfig, region: Region, settings_port: u16) -> O
             style,
             paused: false,
             region,
+            active_app: None,
             config,
             settings_port,
         })),

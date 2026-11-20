@@ -472,6 +472,143 @@ impl Translator for GroqTranslator {
     }
 }
 
+pub struct OpenAiCompatTranslator {
+    client: Client,
+    endpoint_url: String,
+    api_key: Option<String>,
+    model: String,
+    source_lang: String,
+    target_lang: String,
+    cache: HashMap<String, String>,
+    history: VecDeque<(String, String)>,
+    fallback: GoogleTranslator,
+}
+
+impl OpenAiCompatTranslator {
+    /// Creates a translator targeting any OpenAI-compatible `/chat/completions` endpoint.
+    pub fn new(
+        base_url: String,
+        api_key: Option<String>,
+        model: String,
+        source_lang: &str,
+        target_lang: &str,
+    ) -> Result<Self> {
+        let client = Client::builder()
+            .timeout(Duration::from_secs(6))
+            .pool_idle_timeout(Duration::from_secs(90))
+            .build()?;
+
+        let trimmed = base_url.trim().trim_end_matches('/');
+        let endpoint_url = if trimmed.ends_with("/chat/completions") {
+            trimmed.to_string()
+        } else {
+            format!("{trimmed}/chat/completions")
+        };
+
+        let api_key = api_key
+            .map(|k| k.trim().to_string())
+            .filter(|k| !k.is_empty());
+
+        let fallback = GoogleTranslator::new(source_lang, target_lang)?;
+
+        Ok(Self {
+            client,
+            endpoint_url,
+            api_key,
+            model,
+            source_lang: source_lang.to_string(),
+            target_lang: target_lang.to_string(),
+            cache: HashMap::new(),
+            history: VecDeque::with_capacity(4),
+            fallback,
+        })
+    }
+
+    fn call_endpoint(&self, text: &str) -> Result<String> {
+        let sys = build_subtitle_prompt_instructions(&self.source_lang, &self.target_lang);
+        let user_msg = format_user_subtitle_prompt(&self.history, text);
+
+        let body = json!({
+            "model": self.model,
+            "messages": [
+                { "role": "system", "content": sys },
+                { "role": "user", "content": user_msg }
+            ],
+            "temperature": 0.30,
+            "max_tokens": 100
+        });
+
+        let mut req = self.client.post(&self.endpoint_url).json(&body);
+        if let Some(key) = &self.api_key {
+            req = req.bearer_auth(key);
+        }
+
+        let resp = req.send()?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let err_txt = resp.text().unwrap_or_default();
+            return Err(anyhow!(
+                "OpenAI-compatible HTTP {} ({})",
+                status,
+                err_txt.chars().take(160).collect::<String>()
+            ));
+        }
+
+        let json: Value = resp.json()?;
+        let raw = json
+            .pointer("/choices/0/message/content")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("OpenAI-compatible response contained no text"))?;
+
+        let cleaned = strip_think_tags(raw).trim().trim_matches('"').to_string();
+        if cleaned.is_empty() {
+            return Err(anyhow!(
+                "OpenAI-compatible endpoint returned empty translation"
+            ));
+        }
+
+        Ok(cleaned)
+    }
+}
+
+impl Translator for OpenAiCompatTranslator {
+    fn name(&self) -> &'static str {
+        "openai-compat"
+    }
+
+    fn translate(&mut self, text: &str) -> Result<String> {
+        let key = text.trim();
+        if key.is_empty() {
+            return Ok(String::new());
+        }
+        if let Some(cached) = self.cache.get(key) {
+            return Ok(cached.clone());
+        }
+
+        let translated = match self.call_endpoint(key) {
+            Ok(res) => res,
+            Err(e) => {
+                eprintln!("[OpenAI-Compat ERROR -> falling back to Google] {e}");
+                self.fallback.translate(key)?
+            }
+        };
+
+        if !translated.is_empty() {
+            if self.cache.len() > 500 {
+                self.cache.clear();
+            }
+            self.cache.insert(key.to_string(), translated.clone());
+            if self.history.len() >= 3 {
+                self.history.pop_front();
+            }
+            self.history.push_back((key.to_string(), translated.clone()));
+        }
+
+        Ok(translated)
+    }
+}
+
 fn strip_think_tags(s: &str) -> String {
     if let Some(end) = s.find("</think>") {
         return s[end + "</think>".len()..].to_string();

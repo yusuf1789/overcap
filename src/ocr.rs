@@ -158,3 +158,41 @@ impl WinOcr {
         })
     }
 }
+
+/// Returns sorted BCP-47 language tags of all Windows OCR recognizer languages
+/// currently installed on the system (e.g. `["en-US", "tr"]`).
+pub fn available_ocr_languages() -> Vec<String> {
+    let Ok(langs) = OcrEngine::AvailableRecognizerLanguages() else {
+        return Vec::new();
+    };
+    let count = langs.Size().unwrap_or(0);
+    let mut tags = Vec::with_capacity(count as usize);
+    for i in 0..count {
+        if let Ok(lang) = langs.GetAt(i) {
+            if let Ok(tag) = lang.LanguageTag() {
+                let s = tag.to_string();
+                if !s.is_empty() {
+                    tags.push(s);
+                }
+            }
+        }
+    }
+    tags.sort();
+    tags.dedup();
+    tags
+}
+
+/// Returns `true` if any installed Windows OCR language tag matches `lang_hint`
+/// (case-insensitive exact match, or primary-subtag prefix match such as `"en"`
+/// matching `"en-US"` or `"en-GB"`).
+pub fn is_language_installed(lang_hint: &str) -> bool {
+    let hint = lang_hint.trim().to_lowercase();
+    if hint.is_empty() {
+        return false;
+    }
+    let prefix = format!("{hint}-");
+    available_ocr_languages().into_iter().any(|tag| {
+        let lower = tag.to_lowercase();
+        lower == hint || lower.starts_with(&prefix)
+    })
+}

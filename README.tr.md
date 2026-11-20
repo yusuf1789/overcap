@@ -26,10 +26,13 @@ Herhangi bir PC oyunu (Borderless Windowed), konsol ekran aktarımı (Xbox Remot
 - **Çoklu Çeviri Motoru (`Translator` trait):**
   - **Groq (`qwen/qwen3.8-27b`, önerilen):** `~150-280 ms` toplam gecikme, bağlamlı ve günlük/argo uyumlu oyun çevirisi (`reasoning_effort: "none"`).
   - **Google Gemini (`gemini-3.1-flash-lite`):** Bağlamlı ve OCR hata düzeltmeli çeviri.
+  - **OpenAI-Uyumlu / Yerel LLM'ler (`openai-compat` / `ollama`):** Ollama, LM Studio, vLLM veya herhangi bir `/chat/completions` uç noktasına bağlanın (`--custom-base-url`, `--custom-model`, `--custom-key`).
   - **Google Translate:** API anahtarsız ücretsiz seçenek ve diğer motorlar için otomatik yedek (fallback).
+- **Otomatik Uygulama Profilleri:**
+  - `Ctrl + Shift + S` seçilen altyazı bölgesini aktif `.exe` profiline kaydeder; oyunlar veya video oynatıcılar arasında geçiş yaptığınızda Overcap bölgeyi otomatik değiştirir (`--no-auto-profiles` ile veya Ayar Panelinden kapatılabilir).
 - **Yerleşik Canlı Ayar Paneli (`127.0.0.1:8787`):**
   - `Ctrl + Shift + A` ile tarayıcıda açılır.
-  - Font Family, Font Size, Bold, Text Color, Text Shadow, Background Color, Opacity, Border Radius, Padding X/Y, Auto-Fit, Engine ve dil ayarları canlı önizlemeyle yapılır ve otomatik `config.json` dosyasına kaydedilir.
+  - Font Family, Font Size, Bold, Text Color, Text Shadow, Background Color, Opacity, Border Radius, Padding X/Y, Auto-Fit, Engine, dil ayarları, **OCR Tanılama** (kurulu Windows OCR dilleri kontrolü) ve **Uygulama Profilleri** canlı önizlemeyle yapılır ve otomatik `config.json` dosyasına kaydedilir.
 - **High-DPI & Çoklu Monitör:** `DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2` ile `%125` / `%150` Windows ölçeklemelerinde sıfır koordinat kayması.
 
 ---

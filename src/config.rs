@@ -1,5 +1,6 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 
@@ -50,6 +51,16 @@ pub struct AppConfig {
     pub groq_api_key: Option<String>,
     #[serde(default = "default_groq_model")]
     pub groq_model: String,
+    #[serde(default = "default_custom_base_url")]
+    pub custom_base_url: String,
+    #[serde(default)]
+    pub custom_api_key: Option<String>,
+    #[serde(default = "default_custom_model")]
+    pub custom_model: String,
+    #[serde(default = "default_auto_profiles")]
+    pub auto_profiles: bool,
+    #[serde(default)]
+    pub profiles: HashMap<String, Region>,
 }
 
 fn default_font_family() -> String {
@@ -116,6 +127,18 @@ fn default_groq_model() -> String {
     "qwen/qwen3.8-27b".to_string()
 }
 
+fn default_custom_base_url() -> String {
+    "http://127.0.0.1:11434/v1".to_string()
+}
+
+fn default_custom_model() -> String {
+    "qwen2.5:7b".to_string()
+}
+
+fn default_auto_profiles() -> bool {
+    true
+}
+
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
@@ -138,6 +161,11 @@ impl Default for AppConfig {
             gemini_model: default_gemini_model(),
             groq_api_key: None,
             groq_model: default_groq_model(),
+            custom_base_url: default_custom_base_url(),
+            custom_api_key: None,
+            custom_model: default_custom_model(),
+            auto_profiles: default_auto_profiles(),
+            profiles: HashMap::new(),
         }
     }
 }
