@@ -1,18 +1,21 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod capture;
 mod config;
+mod gui;
 mod ocr;
 mod overlay;
 mod profiles;
 mod selector;
-mod settings_ui;
 mod translator;
+mod tray;
 
 use anyhow::Result;
 use clap::Parser;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
 use windows::Win32::UI::HiDpi::{
     SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
@@ -21,9 +24,8 @@ use windows::Win32::UI::HiDpi::{
 use crate::capture::{capture_region, changed_pixel_ratio, upscale_for_ocr};
 use crate::config::AppConfig;
 use crate::ocr::{SourceBounds, WinOcr};
-use crate::overlay::{create_handle, open_settings_in_browser, run_overlay_loop, OverlayHandle};
+use crate::overlay::{create_handle, run_overlay_loop, LogEntry, OverlayHandle};
 use crate::selector::select_region;
-use crate::settings_ui::start_settings_server;
 use crate::translator::{
     is_same_subtitle, GeminiTranslator, GoogleTranslator, GroqTranslator, OpenAiCompatTranslator,
     Translator,
@@ -95,13 +97,9 @@ struct Args {
     #[arg(long)]
     opacity: Option<u8>,
 
-    /// Open the appearance and settings UI in the browser on startup
+    /// Start minimized in the System Tray without showing the main window
     #[arg(long)]
-    settings: bool,
-
-    /// Local port for the settings UI server (default: 8787)
-    #[arg(long, default_value_t = 8787)]
-    settings_port: u16,
+    minimized: bool,
 }
 
 struct TranslationJob {
@@ -133,10 +131,14 @@ impl TranslationSlot {
         }
     }
 
-    fn take_blocking(&self, stop_flag: &std::sync::atomic::AtomicBool) -> Option<TranslationJob> {
+    fn take_blocking(
+        &self,
+        stop_flag: &std::sync::atomic::AtomicBool,
+        reload_flag: &std::sync::atomic::AtomicBool,
+    ) -> Option<TranslationJob> {
         let mut guard = self.job.lock().ok()?;
         while guard.is_none() {
-            if stop_flag.load(Ordering::SeqCst) {
+            if stop_flag.load(Ordering::SeqCst) || reload_flag.load(Ordering::SeqCst) {
                 return None;
             }
             let (g, _) = self
@@ -154,132 +156,117 @@ fn has_meaningful_letters(s: &str) -> bool {
     alpha_count >= 2
 }
 
-fn translation_worker(
-    handle: OverlayHandle,
-    slot: Arc<TranslationSlot>,
-    latest_seq: Arc<std::sync::atomic::AtomicU64>,
-    cleared_seq: Arc<std::sync::atomic::AtomicU64>,
-    engine_name: String,
-    gemini_key: Option<String>,
-    gemini_model: String,
-    groq_key: Option<String>,
-    groq_model: String,
-    custom_base_url: String,
-    custom_key: Option<String>,
-    custom_model: String,
-    source_lang: String,
-    target_lang: String,
-) {
-    let mut translator: Box<dyn Translator> = if engine_name.eq_ignore_ascii_case("groq") {
-        let key = groq_key
+fn current_hms() -> String {
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+        % 86_400;
+    let h = secs / 3600;
+    let m = (secs % 3600) / 60;
+    let s = secs % 60;
+    format!("{h:02}:{m:02}:{s:02}")
+}
+
+fn build_translator(cfg: &AppConfig) -> Result<Box<dyn Translator>> {
+    let engine_name = cfg.engine.as_str();
+    let source_lang = cfg.source_lang.as_str();
+    let target_lang = cfg.target_lang.as_str();
+
+    if engine_name.eq_ignore_ascii_case("groq") {
+        let key = cfg
+            .groq_api_key
+            .clone()
             .filter(|k| !k.trim().is_empty())
             .or_else(|| std::env::var("GROQ_API_KEY").ok().filter(|k| !k.trim().is_empty()));
 
         if let Some(api_key) = key {
-            match GroqTranslator::new(api_key, groq_model.clone(), &source_lang, &target_lang) {
+            match GroqTranslator::new(api_key, cfg.groq_model.clone(), source_lang, target_lang) {
                 Ok(t) => {
-                    println!("[Ready] Groq model: {}", groq_model);
-                    Box::new(t)
+                    println!("[Ready] Groq model: {}", cfg.groq_model);
+                    return Ok(Box::new(t));
                 }
                 Err(e) => {
                     eprintln!("[Groq ERROR] {e} -> falling back to Google");
-                    match GoogleTranslator::new(&source_lang, &target_lang) {
-                        Ok(g) => Box::new(g),
-                        Err(ge) => {
-                            eprintln!("[Translation ERROR] {ge}");
-                            handle.stop_flag.store(true, Ordering::SeqCst);
-                            return;
-                        }
-                    }
                 }
             }
         } else {
             println!("[Warning] GROQ_API_KEY not found (--groq-key or config.json), falling back to Google.");
-            match GoogleTranslator::new(&source_lang, &target_lang) {
-                Ok(g) => Box::new(g),
-                Err(e) => {
-                    eprintln!("[Translation ERROR] {e}");
-                    handle.stop_flag.store(true, Ordering::SeqCst);
-                    return;
-                }
-            }
         }
     } else if engine_name.eq_ignore_ascii_case("gemini") {
-        let key = gemini_key
+        let key = cfg
+            .gemini_api_key
+            .clone()
             .filter(|k| !k.trim().is_empty())
             .or_else(|| std::env::var("GEMINI_API_KEY").ok().filter(|k| !k.trim().is_empty()));
 
         if let Some(api_key) = key {
-            match GeminiTranslator::new(api_key, gemini_model.clone(), &source_lang, &target_lang) {
+            match GeminiTranslator::new(
+                api_key,
+                cfg.gemini_model.clone(),
+                source_lang,
+                target_lang,
+            ) {
                 Ok(t) => {
-                    println!("[Ready] Gemini model: {}", gemini_model);
-                    Box::new(t)
+                    println!("[Ready] Gemini model: {}", cfg.gemini_model);
+                    return Ok(Box::new(t));
                 }
                 Err(e) => {
                     eprintln!("[Gemini ERROR] {e} -> falling back to Google");
-                    match GoogleTranslator::new(&source_lang, &target_lang) {
-                        Ok(g) => Box::new(g),
-                        Err(ge) => {
-                            eprintln!("[Translation ERROR] {ge}");
-                            handle.stop_flag.store(true, Ordering::SeqCst);
-                            return;
-                        }
-                    }
                 }
             }
         } else {
             println!("[Warning] GEMINI_API_KEY not found (--gemini-key or config.json), falling back to Google.");
-            match GoogleTranslator::new(&source_lang, &target_lang) {
-                Ok(g) => Box::new(g),
-                Err(e) => {
-                    eprintln!("[Translation ERROR] {e}");
-                    handle.stop_flag.store(true, Ordering::SeqCst);
-                    return;
-                }
-            }
         }
     } else if engine_name.eq_ignore_ascii_case("openai-compat")
         || engine_name.eq_ignore_ascii_case("custom")
         || engine_name.eq_ignore_ascii_case("ollama")
     {
-        let api_key = custom_key
+        let api_key = cfg
+            .custom_api_key
+            .clone()
             .filter(|k| !k.trim().is_empty())
             .or_else(|| std::env::var("OPENAI_API_KEY").ok().filter(|k| !k.trim().is_empty()));
 
         match OpenAiCompatTranslator::new(
-            custom_base_url.clone(),
+            cfg.custom_base_url.clone(),
             api_key,
-            custom_model.clone(),
-            &source_lang,
-            &target_lang,
+            cfg.custom_model.clone(),
+            source_lang,
+            target_lang,
         ) {
             Ok(t) => {
                 println!(
                     "[Ready] OpenAI-compat endpoint: {} (model: {})",
-                    custom_base_url, custom_model
+                    cfg.custom_base_url, cfg.custom_model
                 );
-                Box::new(t)
+                return Ok(Box::new(t));
             }
             Err(e) => {
                 eprintln!("[OpenAI-compat ERROR] {e} -> falling back to Google");
-                match GoogleTranslator::new(&source_lang, &target_lang) {
-                    Ok(g) => Box::new(g),
-                    Err(ge) => {
-                        eprintln!("[Translation ERROR] {ge}");
-                        handle.stop_flag.store(true, Ordering::SeqCst);
-                        return;
-                    }
-                }
             }
         }
-    } else {
-        match GoogleTranslator::new(&source_lang, &target_lang) {
-            Ok(t) => Box::new(t),
-            Err(e) => {
-                eprintln!("[Translation ERROR] {e}");
-                handle.stop_flag.store(true, Ordering::SeqCst);
-                return;
-            }
+    }
+
+    Ok(Box::new(GoogleTranslator::new(source_lang, target_lang)?))
+}
+
+fn translation_worker(
+    handle: OverlayHandle,
+    slot: Arc<TranslationSlot>,
+    latest_seq: Arc<std::sync::atomic::AtomicU64>,
+    cleared_seq: Arc<std::sync::atomic::AtomicU64>,
+) {
+    let init_cfg = handle.snapshot_config();
+    let mut source_lang = init_cfg.source_lang.clone();
+    let mut target_lang = init_cfg.target_lang.clone();
+
+    let mut translator = match build_translator(&init_cfg) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("[Translation ERROR] {e}");
+            handle.stop_flag.store(true, Ordering::SeqCst);
+            return;
         }
     };
 
@@ -291,7 +278,27 @@ fn translation_worker(
     );
 
     while !handle.stop_flag.load(Ordering::SeqCst) {
-        let Some(job) = slot.take_blocking(&handle.stop_flag) else {
+        if handle.engine_reload_requested.swap(false, Ordering::SeqCst) {
+            let cfg = handle.snapshot_config();
+            source_lang = cfg.source_lang.clone();
+            target_lang = cfg.target_lang.clone();
+            match build_translator(&cfg) {
+                Ok(t) => {
+                    translator = t;
+                    println!(
+                        "[Reloaded] Translation engine: {} ({} -> {})",
+                        translator.name(),
+                        source_lang,
+                        target_lang
+                    );
+                }
+                Err(e) => {
+                    eprintln!("[Reload ERROR] {e}");
+                }
+            }
+        }
+
+        let Some(job) = slot.take_blocking(&handle.stop_flag, &handle.engine_reload_requested) else {
             continue;
         };
 
@@ -314,6 +321,14 @@ fn translation_worker(
                         target_lang.to_uppercase(),
                         translated
                     );
+                    handle.push_log(LogEntry {
+                        timestamp: current_hms(),
+                        total_ms,
+                        ocr_ms: job.ocr_ms,
+                        engine: translator.name().to_string(),
+                        src: job.text,
+                        dst: translated.clone(),
+                    });
                     handle.set_subtitle(translated, job.source_bounds);
                 }
             }
@@ -330,20 +345,21 @@ fn ocr_worker(
     slot: Arc<TranslationSlot>,
     latest_seq: Arc<std::sync::atomic::AtomicU64>,
     cleared_seq: Arc<std::sync::atomic::AtomicU64>,
-    source_lang: String,
+    initial_source_lang: String,
     interval_ms: u64,
 ) {
     unsafe {
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
     }
 
-    let ocr = match WinOcr::new(&source_lang) {
+    let mut active_source_lang = initial_source_lang;
+    let mut ocr = match WinOcr::new(&active_source_lang) {
         Ok(engine) => {
             println!(
                 "[OCR] Windows built-in OCR ready (lang: {}, interval: {} ms)",
                 engine.language_tag, interval_ms
             );
-            if source_lang.eq_ignore_ascii_case("en")
+            if active_source_lang.eq_ignore_ascii_case("en")
                 && !engine.language_tag.to_lowercase().starts_with("en")
             {
                 println!(
@@ -371,16 +387,32 @@ fn ocr_worker(
     while !handle.stop_flag.load(Ordering::SeqCst) {
         if last_profile_check.elapsed() >= Duration::from_millis(500) {
             last_profile_check = Instant::now();
+            let cfg_snap = handle.snapshot_config();
+
+            if !cfg_snap
+                .source_lang
+                .eq_ignore_ascii_case(&active_source_lang)
+            {
+                if let Ok(new_ocr) = WinOcr::new(&cfg_snap.source_lang) {
+                    active_source_lang = cfg_snap.source_lang.clone();
+                    ocr = new_ocr;
+                    prev_bgra = None;
+                    last_src.clear();
+                }
+            }
+
             let fg_app = profiles::foreground_process_name();
             if fg_app != last_fg_app {
                 last_fg_app = fg_app.clone();
                 handle.set_active_app(fg_app.clone());
                 if let Some(ref app) = fg_app {
-                    let cfg_snap = handle.snapshot_config();
                     if cfg_snap.auto_profiles {
                         if let Some(&prof_region) = cfg_snap.profiles.get(app) {
                             if handle.current_region() != prof_region {
-                                println!("[Profile] Switched region for {} -> {:?}", app, prof_region);
+                                println!(
+                                    "[Profile] Switched region for {} -> {:?}",
+                                    app, prof_region
+                                );
                                 handle.set_region_from_profile(prof_region);
                             }
                         }
@@ -404,6 +436,10 @@ fn ocr_worker(
         }
 
         let region = handle.current_region();
+        if region.width <= 0 || region.height <= 0 {
+            thread::sleep(Duration::from_millis(250));
+            continue;
+        }
         let t0 = Instant::now();
 
         let frame = match capture_region(region) {
@@ -538,79 +574,41 @@ fn main() -> Result<()> {
         let _ = cfg.save();
     }
 
-    let region = if args.select || cfg.region.is_none() {
-        println!("Drag on the screen to select the subtitle region (Cancel: ESC)...");
+    let region = if args.select {
         match select_region()? {
             Some(r) => {
                 cfg.region = Some(r);
                 cfg.save()?;
-                println!("[Region] Saved: {:?}", r);
                 r
             }
-            None => {
-                println!("No region selected, exiting.");
-                return Ok(());
-            }
+            None => cfg.region.unwrap_or(crate::config::Region {
+                left: 0,
+                top: 0,
+                width: 0,
+                height: 0,
+            }),
         }
     } else {
-        let r = cfg.region.unwrap();
-        println!("[Region] Using saved region: {:?}", r);
-        r
+        cfg.region.unwrap_or(crate::config::Region {
+            left: 0,
+            top: 0,
+            width: 0,
+            height: 0,
+        })
     };
 
-    println!();
-    println!("=== Hotkeys (Work In-Game) ===");
-    println!("  Ctrl + Shift + A        : Open Appearance & Settings UI (http://127.0.0.1:{})", args.settings_port);
-    println!("  Ctrl + Shift + S        : Re-select subtitle region");
-    println!("  Ctrl + Shift + H        : Toggle overlay visibility / pause");
-    println!("  Ctrl + Shift + Up       : Increase font size");
-    println!("  Ctrl + Shift + Down     : Decrease font size");
-    println!("  Ctrl + Shift + Q        : Quit");
-    println!("==============================\n");
-
     let source_lang = cfg.source_lang.clone();
-    let target_lang = cfg.target_lang.clone();
-    let engine_name = cfg.engine.clone();
-    let gemini_key = cfg.gemini_api_key.clone();
-    let gemini_model = cfg.gemini_model.clone();
-    let groq_key = cfg.groq_api_key.clone();
-    let groq_model = cfg.groq_model.clone();
-    let custom_base_url = cfg.custom_base_url.clone();
-    let custom_key = cfg.custom_api_key.clone();
-    let custom_model = cfg.custom_model.clone();
-    let handle = create_handle(cfg, region, args.settings_port);
+    let handle = create_handle(cfg, region);
     let slot = Arc::new(TranslationSlot::new());
     let latest_seq = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let cleared_seq = Arc::new(std::sync::atomic::AtomicU64::new(0));
-
-    start_settings_server(handle.clone(), args.settings_port);
-    if args.settings {
-        open_settings_in_browser(args.settings_port);
-    }
 
     let tx_handle = handle.clone();
     let tx_slot = slot.clone();
     let tx_seq = latest_seq.clone();
     let tx_cleared = cleared_seq.clone();
-    let tx_src = source_lang.clone();
-    let tx_dst = target_lang.clone();
     thread::spawn(move || {
-        translation_worker(
-            tx_handle,
-            tx_slot,
-            tx_seq,
-            tx_cleared,
-            engine_name,
-            gemini_key,
-            gemini_model,
-            groq_key,
-            groq_model,
-            custom_base_url,
-            custom_key,
-            custom_model,
-            tx_src,
-            tx_dst,
-        );
+        translation_worker(tx_handle, tx_slot, tx_seq, tx_cleared);
     });
 
     let ocr_handle = handle.clone();
@@ -629,6 +627,14 @@ fn main() -> Result<()> {
         );
     });
 
-    run_overlay_loop(handle)?;
+    let overlay_handle = handle.clone();
+    thread::spawn(move || {
+        if let Err(e) = run_overlay_loop(overlay_handle.clone()) {
+            eprintln!("[Overlay ERROR] {e}");
+            overlay_handle.stop_flag.store(true, Ordering::SeqCst);
+        }
+    });
+
+    gui::run_gui(handle, args.minimized)?;
     Ok(())
 }

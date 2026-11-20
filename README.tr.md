@@ -30,9 +30,9 @@ Herhangi bir PC oyunu (Borderless Windowed), konsol ekran aktarımı (Xbox Remot
   - **Google Translate:** API anahtarsız ücretsiz seçenek ve diğer motorlar için otomatik yedek (fallback).
 - **Otomatik Uygulama Profilleri:**
   - `Ctrl + Shift + S` seçilen altyazı bölgesini aktif `.exe` profiline kaydeder; oyunlar veya video oynatıcılar arasında geçiş yaptığınızda Overcap bölgeyi otomatik değiştirir (`--no-auto-profiles` ile veya Ayar Panelinden kapatılabilir).
-- **Yerleşik Canlı Ayar Paneli (`127.0.0.1:8787`):**
-  - `Ctrl + Shift + A` ile tarayıcıda açılır.
-  - Font Family, Font Size, Bold, Text Color, Text Shadow, Background Color, Opacity, Border Radius, Padding X/Y, Auto-Fit, Engine, dil ayarları, **OCR Tanılama** (kurulu Windows OCR dilleri kontrolü) ve **Uygulama Profilleri** canlı önizlemeyle yapılır ve otomatik `config.json` dosyasına kaydedilir.
+- **Yerel Masaüstü Kontrol Merkezi (`egui`) & Sistem Tepsisi:**
+  - Konsol penceresi olmayan Windows masaüstü uygulaması (`Ctrl + Shift + A` veya Sistem Tepsisi ikonu ile açılır/odaklanır; pencereyi kapatmak uygulamayı Sistem Tepsisine küçültür).
+  - Font Family, Font Size, Bold, Text Color, Text Shadow, Background Color, Opacity, Border Radius, Padding X/Y, Auto-Fit, Engine (canlı yeniden yükleme ile), dil ayarları, **OCR Tanılama**, **Uygulama Profilleri** ve **Canlı Kayıt** sekmesi canlı önizlemeyle yapılır ve otomatik `config.json` dosyasına kaydedilir.
 - **High-DPI & Çoklu Monitör:** `DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2` ile `%125` / `%150` Windows ölçeklemelerinde sıfır koordinat kayması.
 
 ---
@@ -89,8 +89,8 @@ veya doğrudan:
 # Altyazı bölgesini yeniden seçerek başlat
 .\start.bat --select
 
-# Başlangıçta görünüm & ayar panelini aç
-.\start.bat --settings
+# Sistem Tepsisinde gizli başlat
+.\target\release\overcap.exe --minimized
 
 # Groq ile başlat (anahtar ve motor config.json'a kaydedilir)
 .\start.bat --engine groq --groq-key gsk_...
@@ -101,8 +101,8 @@ veya doğrudan:
 # Farklı dil çifti (varsayılan: en -> tr)
 .\start.bat --from en --to tr
 
-# Özel tarama aralığı (ms) ve ayar paneli portu
-.\start.bat --interval-ms 100 --settings-port 8787
+# Özel tarama aralığı (ms)
+.\start.bat --interval-ms 100
 ```
 
 Örnek yapılandırma dosyası için [config.example.json](config.example.json) dosyasına bakabilirsiniz. `config.json` `.gitignore` içerisindedir ve API anahtarlarınız repoya dahil edilmez.
@@ -113,7 +113,7 @@ veya doğrudan:
 
 | Kısayol | İşlev |
 |---|---|
-| `Ctrl + Shift + A` | Görünüm & Ayar panelini aç (`http://127.0.0.1:8787`) |
+| `Ctrl + Shift + A` | Overcap kontrol merkezi penceresini aç / odakla |
 | `Ctrl + Shift + S` | Altyazı bölgesini anında yeniden seç |
 | `Ctrl + Shift + H` | Overlay'i geçici gizle / duraklat |
 | `Ctrl + Shift + Yukarı` | Yazı boyutunu büyüt (+2 px) |
@@ -136,9 +136,11 @@ veya doğrudan:
 - `src/capture.rs` — GDI `BitBlt` bölge yakalama, parlak piksel değişim maskesi ve 2x upscale.
 - `src/ocr.rs` — `Windows.Media.Ocr` sarmalayıcısı, satır sıralama ve `BoundingRect` hesabı.
 - `src/translator.rs` — `Translator` trait'i (`GroqTranslator`, `GeminiTranslator`, `GoogleTranslator`), önbellek ve akıllı tekrar filtresi.
-- `src/overlay.rs` — `WDA_EXCLUDEFROMCAPTURE` + click-through Win32 overlay, dinamik Auto-Fit, yuvarlatılmış köşe ve global kısayollar.
+- `src/overlay.rs` — `WDA_EXCLUDEFROMCAPTURE` + click-through Win32 overlay, dinamik Auto-Fit, yuvarlatılmış köşe, sistem tepsisi yönlendirmesi ve global kısayollar.
 - `src/selector.rs` — High-DPI, çoklu monitör uyumlu Win32 bölge seçici.
-- `src/settings_ui.rs` — Yerel HTTP ayar ve canlı önizleme arayüzü (`127.0.0.1:8787`).
+- `src/gui.rs` — Yerel `eframe`/`egui` masaüstü kontrol merkezi ve canlı önizleme arayüzü.
+- `src/tray.rs` — Yerel Win32 Sistem Tepsisi ikonu ve sağ tık menüsü.
+- `src/profiles.rs` — Uygulama bazlı altyazı bölgesi profilleri için ön plan `.exe` algılama.
 - `src/config.rs` — `config.json` okuma/yazma ve hex renk ayrıştırıcı.
 - `start.bat` — Tek tıkla başlatıcı.
 - `config.example.json` — Örnek yapılandırma şablonu.

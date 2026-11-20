@@ -1,6 +1,6 @@
 [package]
 name = "overcap"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 license = "MIT"
 description = "General-purpose low-latency live game and video subtitle translator overlay for Windows"
@@ -8,6 +8,7 @@ description = "General-purpose low-latency live game and video subtitle translat
 [dependencies]
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
+eframe = { version = "0.29", default-features = false, features = ["default_fonts", "glow"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -26,6 +27,7 @@ windows = { version = "0.58", features = [
     "Win32_System_Threading",
     "Win32_UI_HiDpi",
     "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }
 

@@ -1,6 +1,6 @@
 use anyhow::Result;
-use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
@@ -18,21 +18,29 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_A, VK_DOWN, VK_H, VK_Q, VK_S, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect, GetMessageW,
-    PostMessageW, PostQuitMessage, RegisterClassW, SetLayeredWindowAttributes,
-    SetWindowDisplayAffinity, SetWindowPos, ShowWindow, TranslateMessage, CS_HREDRAW, CS_VREDRAW,
-    HWND_TOPMOST, LWA_ALPHA, MSG, SWP_NOACTIVATE, SWP_SHOWWINDOW, SW_HIDE, WDA_EXCLUDEFROMCAPTURE,
-    WM_APP, WM_DESTROY, WM_ERASEBKGND, WM_HOTKEY, WM_PAINT, WNDCLASSW, WS_EX_LAYERED,
-    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+    CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyWindow, DispatchMessageW, GetClientRect,
+    GetMessageW, GetSystemMetrics, PostMessageW, PostQuitMessage, RegisterClassW,
+    SetLayeredWindowAttributes, SetWindowDisplayAffinity, SetWindowPos, ShowWindow,
+    TranslateMessage, CS_HREDRAW, CS_VREDRAW, HICON, HWND_TOPMOST, LWA_ALPHA, MSG, SM_CXSCREEN,
+    SM_CYSCREEN, SWP_NOACTIVATE, SWP_SHOWWINDOW, SW_HIDE, WDA_EXCLUDEFROMCAPTURE, WM_APP,
+    WM_DESTROY, WM_ERASEBKGND, WM_HOTKEY, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_PAINT, WM_RBUTTONUP,
+    WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT,
+    WS_POPUP,
 };
 
 use crate::config::{parse_hex_colorref, AppConfig, Region};
 use crate::ocr::SourceBounds;
 use crate::profiles::foreground_process_name;
 use crate::selector::select_region;
+use crate::tray::{self, TrayAction, WM_APP_TRAY};
 
 const WM_APP_UPDATE: u32 = WM_APP + 1;
 const WM_APP_STYLE: u32 = WM_APP + 2;
+const WM_APP_RESELECT: u32 = WM_APP + 3;
+const WM_APP_TOGGLE_PAUSE: u32 = WM_APP + 4;
+const WM_APP_QUIT: u32 = WM_APP + 5;
+
+const MAX_LOG_ENTRIES: usize = 100;
 
 const HK_QUIT: i32 = 1;
 const HK_TOGGLE: i32 = 2;
@@ -40,6 +48,16 @@ const HK_RESELECT: i32 = 3;
 const HK_FONT_UP: i32 = 4;
 const HK_FONT_DOWN: i32 = 5;
 const HK_SETTINGS: i32 = 6;
+
+#[derive(Debug, Clone)]
+pub struct LogEntry {
+    pub timestamp: String,
+    pub total_ms: u128,
+    pub ocr_ms: u128,
+    pub engine: String,
+    pub src: String,
+    pub dst: String,
+}
 
 #[derive(Debug, Clone)]
 pub struct OverlayStyle {
@@ -82,7 +100,6 @@ pub struct SharedOverlayState {
     pub region: Region,
     pub active_app: Option<String>,
     pub config: AppConfig,
-    pub settings_port: u16,
 }
 
 #[derive(Clone)]
@@ -91,6 +108,10 @@ pub struct OverlayHandle {
     pub state: Arc<Mutex<SharedOverlayState>>,
     pub region_changed: Arc<AtomicBool>,
     pub stop_flag: Arc<AtomicBool>,
+    pub gui_open_requested: Arc<AtomicBool>,
+    pub engine_reload_requested: Arc<AtomicBool>,
+    pub last_latency_ms: Arc<AtomicU64>,
+    pub logs: Arc<Mutex<VecDeque<LogEntry>>>,
 }
 
 impl OverlayHandle {
@@ -204,9 +225,76 @@ impl OverlayHandle {
             self.post_msg(WM_APP_STYLE);
         }
     }
+
+    pub fn push_log(&self, entry: LogEntry) {
+        self.last_latency_ms
+            .store(entry.total_ms as u64, Ordering::SeqCst);
+        if let Ok(mut logs) = self.logs.lock() {
+            while logs.len() >= MAX_LOG_ENTRIES {
+                logs.pop_front();
+            }
+            logs.push_back(entry);
+        }
+    }
+
+    pub fn recent_logs(&self) -> Vec<LogEntry> {
+        self.logs
+            .lock()
+            .map(|logs| logs.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    pub fn clear_logs(&self) {
+        if let Ok(mut logs) = self.logs.lock() {
+            logs.clear();
+        }
+    }
+
+    pub fn request_open_gui(&self) {
+        self.gui_open_requested.store(true, Ordering::SeqCst);
+    }
+
+    pub fn request_engine_reload(&self) {
+        self.engine_reload_requested.store(true, Ordering::SeqCst);
+    }
+
+    pub fn trigger_reselect(&self) {
+        self.post_msg(WM_APP_RESELECT);
+    }
+
+    pub fn toggle_pause(&self) {
+        self.post_msg(WM_APP_TOGGLE_PAUSE);
+    }
+
+    #[allow(dead_code)]
+    pub fn request_quit(&self) {
+        self.stop_flag.store(true, Ordering::SeqCst);
+        self.post_msg(WM_APP_QUIT);
+    }
+
+    pub fn delete_profile(&self, app: &str) -> Result<()> {
+        if let Ok(mut st) = self.state.lock() {
+            st.config.profiles.remove(app);
+            if st.active_app.as_deref() == Some(app) {
+                st.active_app = None;
+            }
+            st.config.save()?;
+        }
+        Ok(())
+    }
+
+    pub fn set_test_preview(&self, show: bool, text: Option<String>) {
+        if show {
+            let preview = text.unwrap_or_else(|| "Overcap live subtitle preview".to_string());
+            self.set_subtitle(preview, None);
+        } else {
+            self.set_subtitle(String::new(), None);
+        }
+    }
 }
 
 static OVERLAY_HANDLE: Mutex<Option<OverlayHandle>> = Mutex::new(None);
+static TRAY_ICON: Mutex<isize> = Mutex::new(0);
 
 fn measure_text_size(text: &str, style: &OverlayStyle, max_width: i32) -> (i32, i32) {
     unsafe {
@@ -292,6 +380,23 @@ fn apply_visibility_and_redraw(hwnd: HWND) {
 
     unsafe {
         if should_show {
+            // If no capture region has been selected yet, fall back to bottom-center of the primary screen
+            // so Overlay Preview works safely without clamping panics.
+            let region = if region.width >= 60 && region.height >= 32 {
+                region
+            } else {
+                let sw = GetSystemMetrics(SM_CXSCREEN).max(800);
+                let sh = GetSystemMetrics(SM_CYSCREEN).max(600);
+                let rw = (sw * 60 / 100).clamp(480, 1200);
+                let rh = 110;
+                Region {
+                    left: (sw - rw) / 2,
+                    top: (sh - rh - 80).max(40),
+                    width: rw,
+                    height: rh,
+                }
+            };
+
             let pad_x = style.padding_x.clamp(4, 60);
             let pad_y = style.padding_y.clamp(2, 40);
 
@@ -319,8 +424,10 @@ fn apply_visibility_and_redraw(hwnd: HWND) {
                 let bw = (tw + pad_x * 2 + 10).max(min_cover_w).min(region.width).max(60);
                 let bh = (th + pad_y * 2 + 4).max(min_cover_h).min(region.height).max(32);
 
-                let bx = (anchor_cx - bw / 2).clamp(region.left, region.left + region.width - bw);
-                let by = (anchor_cy - bh / 2).clamp(region.top, region.top + region.height - bh);
+                let max_x = (region.left + region.width - bw).max(region.left);
+                let max_y = (region.top + region.height - bh).max(region.top);
+                let bx = (anchor_cx - bw / 2).clamp(region.left, max_x);
+                let by = (anchor_cy - bh / 2).clamp(region.top, max_y);
                 (bx, by, bw, bh)
             } else {
                 (region.left, region.top, region.width, region.height)
@@ -344,9 +451,79 @@ fn apply_visibility_and_redraw(hwnd: HWND) {
     }
 }
 
-pub fn open_settings_in_browser(port: u16) {
-    let url = format!("http://127.0.0.1:{}", port);
-    let _ = Command::new("cmd").args(["/C", "start", "", &url]).spawn();
+fn handle_quit(hwnd: HWND) {
+    if let Ok(guard) = OVERLAY_HANDLE.lock() {
+        if let Some(h) = guard.as_ref() {
+            h.stop_flag.store(true, Ordering::SeqCst);
+        }
+    }
+    unsafe {
+        let _ = DestroyWindow(hwnd);
+    }
+}
+
+fn handle_toggle_pause(hwnd: HWND) -> bool {
+    let paused = if let Ok(guard) = OVERLAY_HANDLE.lock() {
+        if let Some(h) = guard.as_ref() {
+            if let Ok(mut st) = h.state.lock() {
+                st.paused = !st.paused;
+                st.paused
+            } else {
+                false
+            }
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+    apply_visibility_and_redraw(hwnd);
+    paused
+}
+
+fn handle_reselect(hwnd: HWND) {
+    let detected_app = foreground_process_name();
+    unsafe {
+        let _ = ShowWindow(hwnd, SW_HIDE);
+    }
+    if let Ok(Some(new_region)) = select_region() {
+        println!("[Region] New region: {:?}", new_region);
+        if let Ok(guard) = OVERLAY_HANDLE.lock() {
+            if let Some(h) = guard.as_ref() {
+                if let Ok(mut st) = h.state.lock() {
+                    st.region = new_region;
+                    st.config.region = Some(new_region);
+                    if let Some(ref app) = detected_app {
+                        st.active_app = Some(app.clone());
+                        st.config.profiles.insert(app.clone(), new_region);
+                        println!("[Profile] Saved region for {}", app);
+                    }
+                    let _ = st.config.save();
+                }
+                h.region_changed.store(true, Ordering::SeqCst);
+            }
+        }
+        unsafe {
+            let _ = SetWindowPos(
+                hwnd,
+                HWND_TOPMOST,
+                new_region.left,
+                new_region.top,
+                new_region.width,
+                new_region.height,
+                SWP_NOACTIVATE,
+            );
+        }
+    }
+    apply_visibility_and_redraw(hwnd);
+}
+
+fn handle_open_gui() {
+    if let Ok(guard) = OVERLAY_HANDLE.lock() {
+        if let Some(h) = guard.as_ref() {
+            h.request_open_gui();
+        }
+    }
 }
 
 unsafe extern "system" fn overlay_wnd_proc(
@@ -357,12 +534,47 @@ unsafe extern "system" fn overlay_wnd_proc(
 ) -> LRESULT {
     match msg {
         WM_ERASEBKGND => LRESULT(1),
-        WM_APP_UPDATE => {
+        WM_APP_UPDATE | WM_APP_STYLE => {
             apply_visibility_and_redraw(hwnd);
             LRESULT(0)
         }
-        WM_APP_STYLE => {
-            apply_visibility_and_redraw(hwnd);
+        WM_APP_RESELECT => {
+            handle_reselect(hwnd);
+            LRESULT(0)
+        }
+        WM_APP_TOGGLE_PAUSE => {
+            let _ = handle_toggle_pause(hwnd);
+            LRESULT(0)
+        }
+        WM_APP_QUIT => {
+            handle_quit(hwnd);
+            LRESULT(0)
+        }
+        WM_APP_TRAY => {
+            let event = lparam.0 as u32;
+            match event {
+                WM_LBUTTONUP | WM_LBUTTONDBLCLK => {
+                    handle_open_gui();
+                }
+                WM_RBUTTONUP => {
+                    let paused = OVERLAY_HANDLE
+                        .lock()
+                        .ok()
+                        .and_then(|g| g.as_ref().map(|h| h.is_paused()))
+                        .unwrap_or(false);
+                    if let Some(action) = tray::show_tray_menu(hwnd, paused) {
+                        match action {
+                            TrayAction::OpenSettings => handle_open_gui(),
+                            TrayAction::SelectRegion => handle_reselect(hwnd),
+                            TrayAction::TogglePause => {
+                                let _ = handle_toggle_pause(hwnd);
+                            }
+                            TrayAction::Quit => handle_quit(hwnd),
+                        }
+                    }
+                }
+                _ => {}
+            }
             LRESULT(0)
         }
         WM_HOTKEY => {
@@ -370,66 +582,18 @@ unsafe extern "system" fn overlay_wnd_proc(
             match id {
                 HK_QUIT => {
                     println!("[Hotkey] Ctrl+Shift+Q -> Shutting down...");
-                    if let Ok(guard) = OVERLAY_HANDLE.lock() {
-                        if let Some(h) = guard.as_ref() {
-                            h.stop_flag.store(true, Ordering::SeqCst);
-                        }
-                    }
-                    let _ = DestroyWindow(hwnd);
+                    handle_quit(hwnd);
                 }
                 HK_TOGGLE => {
-                    let paused = if let Ok(guard) = OVERLAY_HANDLE.lock() {
-                        if let Some(h) = guard.as_ref() {
-                            if let Ok(mut st) = h.state.lock() {
-                                st.paused = !st.paused;
-                                st.paused
-                            } else {
-                                false
-                            }
-                        } else {
-                            false
-                        }
-                    } else {
-                        false
-                    };
+                    let paused = handle_toggle_pause(hwnd);
                     println!(
                         "[Hotkey] Ctrl+Shift+H -> {}",
                         if paused { "Paused (hidden)" } else { "Resumed" }
                     );
-                    apply_visibility_and_redraw(hwnd);
                 }
                 HK_RESELECT => {
-                    let detected_app = foreground_process_name();
                     println!("[Hotkey] Ctrl+Shift+S -> Selecting new subtitle region...");
-                    let _ = ShowWindow(hwnd, SW_HIDE);
-                    if let Ok(Some(new_region)) = select_region() {
-                        println!("[Region] New region: {:?}", new_region);
-                        if let Ok(guard) = OVERLAY_HANDLE.lock() {
-                            if let Some(h) = guard.as_ref() {
-                                if let Ok(mut st) = h.state.lock() {
-                                    st.region = new_region;
-                                    st.config.region = Some(new_region);
-                                    if let Some(ref app) = detected_app {
-                                        st.active_app = Some(app.clone());
-                                        st.config.profiles.insert(app.clone(), new_region);
-                                        println!("[Profile] Saved region for {}", app);
-                                    }
-                                    let _ = st.config.save();
-                                }
-                                h.region_changed.store(true, Ordering::SeqCst);
-                            }
-                        }
-                        let _ = SetWindowPos(
-                            hwnd,
-                            HWND_TOPMOST,
-                            new_region.left,
-                            new_region.top,
-                            new_region.width,
-                            new_region.height,
-                            SWP_NOACTIVATE,
-                        );
-                    }
-                    apply_visibility_and_redraw(hwnd);
+                    handle_reselect(hwnd);
                 }
                 HK_FONT_UP | HK_FONT_DOWN => {
                     let delta = if id == HK_FONT_UP { 2 } else { -2 };
@@ -447,13 +611,8 @@ unsafe extern "system" fn overlay_wnd_proc(
                     let _ = UpdateWindow(hwnd);
                 }
                 HK_SETTINGS => {
-                    let port = OVERLAY_HANDLE
-                        .lock()
-                        .ok()
-                        .and_then(|g| g.as_ref().and_then(|h| h.state.lock().ok().map(|s| s.settings_port)))
-                        .unwrap_or(8787);
-                    println!("[Hotkey] Ctrl+Shift+A -> Opening settings UI: http://127.0.0.1:{}", port);
-                    open_settings_in_browser(port);
+                    println!("[Hotkey] Ctrl+Shift+A -> Opening Overcap window...");
+                    handle_open_gui();
                 }
                 _ => {}
             }
@@ -582,6 +741,13 @@ unsafe extern "system" fn overlay_wnd_proc(
             let _ = UnregisterHotKey(hwnd, HK_FONT_UP);
             let _ = UnregisterHotKey(hwnd, HK_FONT_DOWN);
             let _ = UnregisterHotKey(hwnd, HK_SETTINGS);
+            tray::remove_tray_icon(hwnd);
+            if let Ok(mut icon_guard) = TRAY_ICON.lock() {
+                if *icon_guard != 0 {
+                    let _ = DestroyIcon(HICON(*icon_guard as *mut _));
+                    *icon_guard = 0;
+                }
+            }
             PostQuitMessage(0);
             LRESULT(0)
         }
@@ -589,7 +755,7 @@ unsafe extern "system" fn overlay_wnd_proc(
     }
 }
 
-pub fn create_handle(config: AppConfig, region: Region, settings_port: u16) -> OverlayHandle {
+pub fn create_handle(config: AppConfig, region: Region) -> OverlayHandle {
     let style = OverlayStyle::from_config(&config);
     OverlayHandle {
         hwnd_raw: Arc::new(Mutex::new(0)),
@@ -601,10 +767,13 @@ pub fn create_handle(config: AppConfig, region: Region, settings_port: u16) -> O
             region,
             active_app: None,
             config,
-            settings_port,
         })),
         region_changed: Arc::new(AtomicBool::new(false)),
         stop_flag: Arc::new(AtomicBool::new(false)),
+        gui_open_requested: Arc::new(AtomicBool::new(false)),
+        engine_reload_requested: Arc::new(AtomicBool::new(false)),
+        last_latency_ms: Arc::new(AtomicU64::new(0)),
+        logs: Arc::new(Mutex::new(VecDeque::with_capacity(MAX_LOG_ENTRIES))),
     }
 }
 
@@ -673,6 +842,16 @@ pub fn run_overlay_loop(handle: OverlayHandle) -> Result<()> {
         let _ = RegisterHotKey(hwnd, HK_FONT_UP, mods, VK_UP.0 as u32);
         let _ = RegisterHotKey(hwnd, HK_FONT_DOWN, mods, VK_DOWN.0 as u32);
         let _ = RegisterHotKey(hwnd, HK_SETTINGS, mods, VK_A.0 as u32);
+
+        if let Ok(hicon) = tray::create_hicon(32) {
+            if tray::add_tray_icon(hwnd, hicon).is_ok() {
+                if let Ok(mut icon_guard) = TRAY_ICON.lock() {
+                    *icon_guard = hicon.0 as isize;
+                }
+            } else {
+                let _ = DestroyIcon(hicon);
+            }
+        }
 
         // Start hidden until a subtitle appears
         let _ = ShowWindow(hwnd, SW_HIDE);

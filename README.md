@@ -30,9 +30,9 @@ Works game-independently with PC games (Borderless Windowed), console streaming/
   - **Google Translate:** Keyless free default and automatic fallback on API errors.
 - **Automatic Per-App Profiles:**
   - `Ctrl + Shift + S` saves the selected subtitle region to the active `.exe` profile, and Overcap automatically switches regions when you switch games or video players (disable with `--no-auto-profiles` or in Settings UI).
-- **Built-In Live Settings UI (`127.0.0.1:8787`):**
-  - Open in browser anytime with `Ctrl + Shift + A`.
-  - Configure Font Family, Font Size, Bold, Text Color, Text Shadow, Background Color, Opacity, Border Radius, Padding X/Y, Auto-Fit Container, Engine, Languages, **OCR Diagnostics** (installed Windows OCR language check), and **App Profiles** with live preview and automatic saving to `config.json`.
+- **Native Desktop Control Center (`egui`) & System Tray:**
+  - Consoleless Windows desktop app (`Ctrl + Shift + A` or System Tray icon to open/focus; closing the window minimizes to the System Tray).
+  - Configure Font Family, Font Size, Bold, Text Color, Text Shadow, Background Color, Opacity, Border Radius, Padding X/Y, Auto-Fit Container, Engine (with live reload), Languages, **OCR Diagnostics**, **App Profiles**, and **Live Log** with live preview and automatic saving to `config.json`.
 - **High-DPI & Multi-Monitor Ready:** Uses `DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2` for 1:1 coordinate accuracy across `%125` / `%150` Windows display scaling.
 
 ---
@@ -89,8 +89,8 @@ On first launch, the screen dims so you can drag-select the subtitle strip. Coor
 # Re-select the subtitle region on startup
 .\start.bat --select
 
-# Open the appearance & settings UI on startup
-.\start.bat --settings
+# Start minimized in the System Tray
+.\target\release\overcap.exe --minimized
 
 # Run with Groq (key and engine are saved to config.json)
 .\start.bat --engine groq --groq-key gsk_...
@@ -101,8 +101,8 @@ On first launch, the screen dims so you can drag-select the subtitle strip. Coor
 # Custom language pair (default: en -> tr)
 .\start.bat --from en --to tr
 
-# Custom scan interval (ms) and settings UI port
-.\start.bat --interval-ms 100 --settings-port 8787
+# Custom scan interval (ms)
+.\start.bat --interval-ms 100
 ```
 
 See [config.example.json](config.example.json) for a configuration template. `config.json` is listed in `.gitignore` so API keys are never committed.
@@ -113,7 +113,7 @@ See [config.example.json](config.example.json) for a configuration template. `co
 
 | Hotkey | Action |
 |---|---|
-| `Ctrl + Shift + A` | Open Appearance & Settings UI (`http://127.0.0.1:8787`) |
+| `Ctrl + Shift + A` | Open / focus Overcap control center window |
 | `Ctrl + Shift + S` | Re-select subtitle capture region |
 | `Ctrl + Shift + H` | Toggle overlay visibility / pause |
 | `Ctrl + Shift + Up` | Increase font size (+2 px) |
@@ -136,9 +136,11 @@ See [config.example.json](config.example.json) for a configuration template. `co
 - `src/capture.rs` — GDI `BitBlt` region capture, bright-pixel change mask, and 2x bilinear upscale.
 - `src/ocr.rs` — `Windows.Media.Ocr` wrapper, line ordering, and `SourceBounds` calculation.
 - `src/translator.rs` — `Translator` trait (`GroqTranslator`, `GeminiTranslator`, `GoogleTranslator`), cache, and smart duplicate filter.
-- `src/overlay.rs` — `WDA_EXCLUDEFROMCAPTURE` + click-through Win32 overlay, dynamic Auto-Fit, rounded corners, and global hotkeys.
+- `src/overlay.rs` — `WDA_EXCLUDEFROMCAPTURE` + click-through Win32 overlay, dynamic Auto-Fit, rounded corners, tray dispatch, and global hotkeys.
 - `src/selector.rs` — High-DPI, multi-monitor Win32 region selector.
-- `src/settings_ui.rs` — Local HTTP settings and live preview UI (`127.0.0.1:8787`).
+- `src/gui.rs` — Native `eframe`/`egui` desktop control center and live preview UI.
+- `src/tray.rs` — Native Win32 System Tray icon and context menu.
+- `src/profiles.rs` — Foreground `.exe` detection for per-app subtitle region profiles.
 - `src/config.rs` — `config.json` serialization and hex color parser.
 - `start.bat` — One-click Windows launcher.
 - `config.example.json` — Example configuration template.

@@ -14,6 +14,12 @@ The canonical version number is maintained in `package.version` inside [Cargo.to
 
 ## Changelog
 
+### `v0.3.0` — Native Rust `egui` Desktop App, System Tray & Consoleless Mode
+- Replaced the local HTTP/browser settings server (`settings_ui.rs`) with a native `eframe` / `egui` desktop control center (`src/gui.rs`) featuring a Neutral Dark Graphite default theme, Light gray toggle, `EN`/`TR` language toggle, live subtitle preview strip, and 4 tabs (`Appearance`, `Engine`, `Profiles & OCR`, `Live Log`).
+- Added native Windows System Tray integration (`src/tray.rs`) with a custom geometric icon, right-click menu (`Open Overcap`, `Select Region`, `Pause`/`Resume`, `Quit`), and minimize-to-tray on window close.
+- Enabled consoleless release builds (`#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]`) and added `--minimized` CLI flag to start hidden in the System Tray.
+- Added live engine reloading (`Save & Reload Engine`) in `translation_worker` / `ocr_worker` and real-time translation log entries (`LogEntry`) in `OverlayHandle`.
+
 ### `v0.2.0` — OpenAI-Compatible Endpoints, Auto App Profiles & OCR Diagnostics
 - Added `OpenAiCompatTranslator` (`--engine openai-compat`, also accepts `custom` / `ollama` aliases) for local LLMs (Ollama, LM Studio, vLLM) and custom OpenAI-compatible `/chat/completions` endpoints via `--custom-base-url`, `--custom-model`, and `--custom-key`.
 - Added automatic per-app subtitle region profiles (`src/profiles.rs`): `Ctrl + Shift + S` binds the selected region to the active foreground `.exe`, and `ocr_worker` automatically switches regions when switching between apps/games without stealing focus (disable with `--no-auto-profiles` or in Settings UI).

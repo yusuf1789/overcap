@@ -15,7 +15,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
     GetSystemMetrics, LoadCursorW, PostQuitMessage, RegisterClassW, SetLayeredWindowAttributes,
     ShowWindow, TranslateMessage, CS_HREDRAW, CS_VREDRAW, IDC_CROSS, LWA_ALPHA, MSG,
-    SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SW_SHOW,
+    SM_CXSCREEN, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+    SW_SHOW,
     WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT,
     WM_RBUTTONDOWN, WNDCLASSW, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
@@ -185,11 +186,17 @@ unsafe extern "system" fn selector_wnd_proc(
                 let old_font = SelectObject(mem_dc, font);
                 SetBkMode(mem_dc, TRANSPARENT);
                 SetTextColor(mem_dc, COLORREF(0x0088FF00)); // #00FF88 (BGR)
+                let (vx, vy) = STATE
+                    .lock()
+                    .ok()
+                    .and_then(|g| g.as_ref().map(|s| (s.vx, s.vy)))
+                    .unwrap_or((0, 0));
+                let primary_w = GetSystemMetrics(SM_CXSCREEN).max(640);
                 let mut banner = RECT {
-                    left: 0,
-                    top: 40,
-                    right: vw,
-                    bottom: 90,
+                    left: -vx,
+                    top: (-vy) + 40,
+                    right: (-vx) + primary_w,
+                    bottom: (-vy) + 90,
                 };
                 let mut msg_w: Vec<u16> =
                     "Drag to select subtitle region   (ESC or Right-Click to cancel)"
