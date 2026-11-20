@@ -65,7 +65,9 @@ With the Rust `msvc` toolchain installed:
 cargo build --release
 ```
 
-Output binary: `target\release\overcap.exe`
+Output binary: `target\release\overcap.exe` (single portable executable with statically linked CRT; `config.json` is stored next to the executable).
+
+> Note on unsigned binaries: If you download a prebuilt `overcap.exe` from Releases, Windows SmartScreen may show a warning on first run ("More info" -> "Run anyway"). You can always inspect the source and build locally with `cargo build --release`.
 
 ### 3. Run
 

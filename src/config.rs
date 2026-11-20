@@ -171,8 +171,27 @@ impl Default for AppConfig {
 }
 
 impl AppConfig {
+    /// Resolves `config.json` for portable usage:
+    /// 1. Prefer `config.json` next to `overcap.exe` if it exists.
+    /// 2. Fall back to `config.json` in the current working directory if it exists (dev/launcher compatibility).
+    /// 3. Otherwise default to the executable's directory so portable installs stay self-contained.
     pub fn path() -> PathBuf {
-        PathBuf::from("config.json")
+        let exe_cfg = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.join("config.json")));
+
+        if let Some(ref p) = exe_cfg {
+            if p.exists() {
+                return p.clone();
+            }
+        }
+
+        let cwd_cfg = PathBuf::from("config.json");
+        if cwd_cfg.exists() {
+            return cwd_cfg;
+        }
+
+        exe_cfg.unwrap_or(cwd_cfg)
     }
 
     pub fn load() -> Self {

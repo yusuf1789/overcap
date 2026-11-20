@@ -65,7 +65,9 @@ Rust (`msvc` toolchain) kuruluysa:
 cargo build --release
 ```
 
-Çıktı: `target\release\overcap.exe`
+Çıktı: `target\release\overcap.exe` (statik CRT ile derlenmiş tek taşınabilir `.exe`; `config.json` çalıştırılabilir dosyanın yanında saklanır).
+
+> İmzasız dosya notu: Releases üzerinden hazır `overcap.exe` indirildiğinde Windows SmartScreen ilk açılışta uyarı gösterebilir ("Ek bilgi" -> "Yine de çalıştır"). Dilerseniz kodu inceleyip doğrudan `cargo build --release` ile kendiniz derleyebilirsiniz.
 
 ### 3. Çalıştırma
 
