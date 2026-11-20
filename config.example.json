@@ -1,0 +1,26 @@
+{
+  "region": {
+    "left": 240,
+    "top": 880,
+    "width": 1440,
+    "height": 140
+  },
+  "font_family": "Bahnschrift",
+  "font_size": 28,
+  "font_bold": true,
+  "text_color": "#FFFFFF",
+  "bg_color": "#0A0A0C",
+  "opacity": 230,
+  "corner_radius": 12,
+  "text_shadow": true,
+  "fit_to_text": true,
+  "padding_x": 18,
+  "padding_y": 10,
+  "source_lang": "en",
+  "target_lang": "tr",
+  "engine": "groq",
+  "gemini_api_key": "",
+  "gemini_model": "gemini-3.1-flash-lite",
+  "groq_api_key": "",
+  "groq_model": "qwen/qwen3.8-27b"
+}
