@@ -16,6 +16,20 @@ The canonical version number is maintained in `package.version` inside [Cargo.to
 
 ## Changelog
 
+### `v0.4.4` — In-Game Translation History
+- `Ctrl+Shift+L`, son 15 hedef çeviriyi gösteren, oyundan odak almayan yerel geçmiş panelini açar/kapatır. Live Log ekranında da aç/kapat düğmesi bulunur.
+- Geçmiş eskiden yeniye sıralanır; fare tekerleği veya panel açıkken `Ctrl+Shift+PageUp/PageDown` ile kaydırılır. Yeni sonuçlar gelirken eski replikleri okuma konumu korunur.
+- Ayrı Win32 katmanlı pencere `WDA_EXCLUDEFROMCAPTURE` ile korunur. Çeviri/OCR çalışmaya devam eder; geçmiş diske yazılmaz ve Live Log temizlendiğinde silinir.
+- Türkçe/İngilizce arayüz metinleri, monitör çalışma alanına uyum ve DPI ölçeklemesi eklenmiştir. Pencere kapatıldığında sayfa kısayolları serbest bırakılır.
+
+### `v0.4.3` — Actual Engine Status & Latency Diagnostics
+- Seçilen motor, başarıyla başlatılan motor ve son çeviriyi üreten sağlayıcı ayrı gösterilir; Google yedeği ve önbellek sonuçları doğru etiketlenir.
+- Motor yenileme durumu işçiden bildirilir; önceki nesle ait devam eden çeviriler yeni motorun sonucu olarak yayımlanmaz. Kaydetme başarısızsa girilen API anahtarı korunur.
+- Engine ekranında kullanılan ve varsa kullanılmayan ayar dosyalarının yolları gösterilir; anahtar rozetleri ortam değişkenlerini de tanır.
+- Live Log yakalama/OCR, bekleme ve çeviri sürelerini; gerçek model, adres denemeleri ve ana/yedek süreleriyle birlikte kaydeder. Toplam ölçümünün sınırları açıklanır.
+- Varsayılan olarak kapalı yerel OCR teşhisi, en fazla 60 BMP/JSON çiftini sınırlı bir arka plan kuyruğuyla saklar. Çeviri promptu, bağlamı ve tekrar eşikleri korunur.
+- Yerel HTTP testleri ana/yedek motor geçişlerini, önbelleği ve hata raporlamasını; ek testler yenileme nesillerini ve görüntü kaydı sınırını doğrular.
+
 ### `v0.4.2` — Config Path & Region Save Diagnostics
 - A warning banner now appears when two `config.json` files exist (one next to the exe wins, the one in the working directory is ignored), naming both paths. Launching the exe directly with no config nearby creates a fresh default one, which then shadows a project-root config.
 - Region reselection now reports selector failures and logs the exact config path used for saves; config save errors include that path instead of being silently ambiguous.

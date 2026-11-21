@@ -2,11 +2,37 @@ use anyhow::{anyhow, Result};
 use reqwest::blocking::Client;
 use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+/// Her çağrının gerçek kaynağı saklanır; seçilen motor adı tek başına
+/// Google yedeği veya önbellekten gelen bir sonucu doğru tanımlamaz.
+#[derive(Clone, Debug, Default)]
+pub struct TranslationReport {
+    /// Başarılı sonuçta metni gerçekten üreten sağlayıcı; hatada son denenen sağlayıcı.
+    pub engine: String,
+    /// Google'da model seçimi olmadığı için bu alan boş bırakılır.
+    pub model: String,
+    /// Yedek kullanıldığında Google önbelleği de bu bayrağa dahildir.
+    pub cached: bool,
+    /// Kimlik bilgisi/sorgu içermeyen sabit Google adres etiketi.
+    pub endpoint: Option<String>,
+    /// Ana istek ve Google adres denemelerinin toplamı; önbellek HTTP isteği sayılmaz.
+    pub attempts: usize,
+    pub fallback: bool,
+    /// Ana motorun tüm adres denemeleri dahil süresi; yedek ayrı ölçülür.
+    pub primary_ms: u128,
+    pub fallback_ms: u128,
+}
 
 pub trait Translator: Send {
     fn name(&self) -> &'static str;
     fn translate(&mut self, text: &str) -> Result<String>;
+
+    /// Model ve son çağrı raporu, API anahtarı taşımayan durum verileridir.
+    fn model(&self) -> &str {
+        ""
+    }
+    fn report(&self) -> TranslationReport;
 
     /// Returns and clears a note about the last `translate` call, e.g. that the primary
     /// backend failed and the Google fallback was used. The worker surfaces it in the GUI.
@@ -21,6 +47,10 @@ pub struct GoogleTranslator {
     target_lang: String,
     cache: HashMap<String, String>,
     preferred_endpoint: usize,
+    report: TranslationReport,
+    /// Testler gerçek Google servisine ulaşmadan adres geçişlerini doğrular.
+    #[cfg(test)]
+    test_base_url: Option<String>,
 }
 
 impl GoogleTranslator {
@@ -36,14 +66,30 @@ impl GoogleTranslator {
             source_lang: source_lang.to_string(),
             target_lang: target_lang.to_string(),
             cache: HashMap::new(),
+            report: TranslationReport::default(),
+            #[cfg(test)]
+            test_base_url: None,
             preferred_endpoint: 1, // clients5 JSON is much faster than mobile HTML
         })
+    }
+
+    /// Üretimde adresler değişmez; yalnızca test derlemesi yerel sunucu kullanabilir.
+    fn endpoint(&self, production: &str) -> String {
+        #[cfg(test)]
+        if let Some(base) = &self.test_base_url {
+            let suffix = production
+                .split_once(".com/")
+                .map(|(_, p)| p)
+                .unwrap_or("translate_a/single");
+            return format!("{base}/{suffix}");
+        }
+        production.to_string()
     }
 
     fn try_mobile_web(&self, text: &str) -> Result<String> {
         let resp = self
             .client
-            .get("https://translate.google.com/m")
+            .get(self.endpoint("https://translate.google.com/m"))
             .query(&[
                 ("sl", self.source_lang.as_str()),
                 ("tl", self.target_lang.as_str()),
@@ -73,7 +119,7 @@ impl GoogleTranslator {
     fn try_clients5(&self, text: &str) -> Result<String> {
         let resp = self
             .client
-            .get("https://clients5.google.com/translate_a/t")
+            .get(self.endpoint("https://clients5.google.com/translate_a/t"))
             .query(&[
                 ("client", "dict-chrome-ex"),
                 ("sl", self.source_lang.as_str()),
@@ -108,7 +154,7 @@ impl GoogleTranslator {
     fn try_gtx(&self, text: &str) -> Result<String> {
         let resp = self
             .client
-            .get("https://translate.googleapis.com/translate_a/single")
+            .get(self.endpoint("https://translate.googleapis.com/translate_a/single"))
             .query(&[
                 ("client", "gtx"),
                 ("sl", self.source_lang.as_str()),
@@ -144,12 +190,24 @@ impl Translator for GoogleTranslator {
         "google"
     }
 
+    /// Rapor kopyası işçi tarafından log ve arayüze güvenle taşınır.
+    fn report(&self) -> TranslationReport {
+        self.report.clone()
+    }
+
     fn translate(&mut self, text: &str) -> Result<String> {
+        // Önceki çağrının yedek/önbellek bilgisi yeni satıra sızmamalıdır.
+        self.report = TranslationReport {
+            engine: self.name().to_string(),
+            model: self.model().to_string(),
+            ..Default::default()
+        };
         let key = text.trim();
         if key.is_empty() {
             return Ok(String::new());
         }
         if let Some(cached) = self.cache.get(key) {
+            self.report.cached = true;
             return Ok(cached.clone());
         }
 
@@ -160,7 +218,18 @@ impl Translator for GoogleTranslator {
         ];
 
         let mut last_err = anyhow!("Translation failed");
+        let started = Instant::now();
         for idx in order {
+            // Yalnızca adresin sabit adı tutulur; sorgu ve kullanıcı metni URL olarak loglanmaz.
+            self.report.attempts += 1;
+            self.report.endpoint = Some(
+                match idx {
+                    0 => "mobile",
+                    1 => "clients5",
+                    _ => "gtx",
+                }
+                .into(),
+            );
             let res = match idx {
                 0 => self.try_mobile_web(key),
                 1 => self.try_clients5(key),
@@ -168,6 +237,7 @@ impl Translator for GoogleTranslator {
             };
             match res {
                 Ok(result) if !result.is_empty() => {
+                    self.report.primary_ms = started.elapsed().as_millis();
                     self.preferred_endpoint = idx;
                     if self.cache.len() > 500 {
                         self.cache.clear();
@@ -182,6 +252,7 @@ impl Translator for GoogleTranslator {
             }
         }
 
+        self.report.primary_ms = started.elapsed().as_millis();
         Err(last_err)
     }
 }
@@ -230,6 +301,7 @@ pub struct GeminiTranslator {
     history: VecDeque<(String, String)>,
     fallback: GoogleTranslator,
     fallback_notice: Option<String>,
+    report: TranslationReport,
 }
 
 impl GeminiTranslator {
@@ -256,6 +328,7 @@ impl GeminiTranslator {
             history: VecDeque::with_capacity(4),
             fallback,
             fallback_notice: None,
+            report: TranslationReport::default(),
         })
     }
 
@@ -327,21 +400,56 @@ impl Translator for GeminiTranslator {
         self.fallback_notice.take()
     }
 
+    /// Rapor kopyası işçi tarafından log ve arayüze güvenle taşınır.
+    fn report(&self) -> TranslationReport {
+        self.report.clone()
+    }
+
+    fn model(&self) -> &str {
+        &self.model
+    }
+
     fn translate(&mut self, text: &str) -> Result<String> {
+        // Önceki çağrının yedek/önbellek bilgisi yeni satıra sızmamalıdır.
+        self.report = TranslationReport {
+            engine: self.name().to_string(),
+            model: self.model().to_string(),
+            ..Default::default()
+        };
+        self.fallback_notice = None;
         let key = text.trim();
         if key.is_empty() {
             return Ok(String::new());
         }
         if let Some(cached) = self.cache.get(key) {
+            self.report.cached = true;
             return Ok(cached.clone());
         }
 
+        let started = Instant::now();
+        self.report.attempts = 1;
         let (translated, from_primary) = match self.call_gemini(key) {
-            Ok(res) => (res, true),
+            Ok(res) => {
+                self.report.primary_ms = started.elapsed().as_millis();
+                (res, true)
+            }
             Err(e) => {
                 eprintln!("[Gemini ERROR -> falling back to Google] {e}");
-                self.fallback_notice = Some(format!("{e} | used Google for this line"));
-                (self.fallback.translate(key)?, false)
+                let primary_ms = started.elapsed().as_millis();
+                let fallback_started = Instant::now();
+                let result = self.fallback.translate(key);
+                self.report = self.fallback.report();
+                self.report.fallback = true;
+                self.report.attempts += 1;
+                self.report.primary_ms = primary_ms;
+                self.report.fallback_ms = fallback_started.elapsed().as_millis();
+                // Yedek başarısızsa kullanıcıya çeviri yapılmış gibi bilgi verilmez.
+                self.fallback_notice = Some(if result.is_ok() {
+                    format!("{e} | Google fallback succeeded")
+                } else {
+                    format!("{e} | Google fallback also failed")
+                });
+                (result?, false)
             }
         };
 
@@ -373,6 +481,7 @@ pub struct GroqTranslator {
     history: VecDeque<(String, String)>,
     fallback: GoogleTranslator,
     fallback_notice: Option<String>,
+    report: TranslationReport,
 }
 
 impl GroqTranslator {
@@ -399,6 +508,7 @@ impl GroqTranslator {
             history: VecDeque::with_capacity(4),
             fallback,
             fallback_notice: None,
+            report: TranslationReport::default(),
         })
     }
 
@@ -465,21 +575,56 @@ impl Translator for GroqTranslator {
         self.fallback_notice.take()
     }
 
+    /// Rapor kopyası işçi tarafından log ve arayüze güvenle taşınır.
+    fn report(&self) -> TranslationReport {
+        self.report.clone()
+    }
+
+    fn model(&self) -> &str {
+        &self.model
+    }
+
     fn translate(&mut self, text: &str) -> Result<String> {
+        // Önceki çağrının yedek/önbellek bilgisi yeni satıra sızmamalıdır.
+        self.report = TranslationReport {
+            engine: self.name().to_string(),
+            model: self.model().to_string(),
+            ..Default::default()
+        };
+        self.fallback_notice = None;
         let key = text.trim();
         if key.is_empty() {
             return Ok(String::new());
         }
         if let Some(cached) = self.cache.get(key) {
+            self.report.cached = true;
             return Ok(cached.clone());
         }
 
+        let started = Instant::now();
+        self.report.attempts = 1;
         let (translated, from_primary) = match self.call_groq(key) {
-            Ok(res) => (res, true),
+            Ok(res) => {
+                self.report.primary_ms = started.elapsed().as_millis();
+                (res, true)
+            }
             Err(e) => {
                 eprintln!("[Groq ERROR -> falling back to Google] {e}");
-                self.fallback_notice = Some(format!("{e} | used Google for this line"));
-                (self.fallback.translate(key)?, false)
+                let primary_ms = started.elapsed().as_millis();
+                let fallback_started = Instant::now();
+                let result = self.fallback.translate(key);
+                self.report = self.fallback.report();
+                self.report.fallback = true;
+                self.report.attempts += 1;
+                self.report.primary_ms = primary_ms;
+                self.report.fallback_ms = fallback_started.elapsed().as_millis();
+                // Yedek başarısızsa kullanıcıya çeviri yapılmış gibi bilgi verilmez.
+                self.fallback_notice = Some(if result.is_ok() {
+                    format!("{e} | Google fallback succeeded")
+                } else {
+                    format!("{e} | Google fallback also failed")
+                });
+                (result?, false)
             }
         };
 
@@ -512,6 +657,7 @@ pub struct OpenAiCompatTranslator {
     history: VecDeque<(String, String)>,
     fallback: GoogleTranslator,
     fallback_notice: Option<String>,
+    report: TranslationReport,
 }
 
 impl OpenAiCompatTranslator {
@@ -552,6 +698,7 @@ impl OpenAiCompatTranslator {
             history: VecDeque::with_capacity(4),
             fallback,
             fallback_notice: None,
+            report: TranslationReport::default(),
         })
     }
 
@@ -612,21 +759,56 @@ impl Translator for OpenAiCompatTranslator {
         self.fallback_notice.take()
     }
 
+    /// Rapor kopyası işçi tarafından log ve arayüze güvenle taşınır.
+    fn report(&self) -> TranslationReport {
+        self.report.clone()
+    }
+
+    fn model(&self) -> &str {
+        &self.model
+    }
+
     fn translate(&mut self, text: &str) -> Result<String> {
+        // Önceki çağrının yedek/önbellek bilgisi yeni satıra sızmamalıdır.
+        self.report = TranslationReport {
+            engine: self.name().to_string(),
+            model: self.model().to_string(),
+            ..Default::default()
+        };
+        self.fallback_notice = None;
         let key = text.trim();
         if key.is_empty() {
             return Ok(String::new());
         }
         if let Some(cached) = self.cache.get(key) {
+            self.report.cached = true;
             return Ok(cached.clone());
         }
 
+        let started = Instant::now();
+        self.report.attempts = 1;
         let (translated, from_primary) = match self.call_endpoint(key) {
-            Ok(res) => (res, true),
+            Ok(res) => {
+                self.report.primary_ms = started.elapsed().as_millis();
+                (res, true)
+            }
             Err(e) => {
                 eprintln!("[OpenAI-Compat ERROR -> falling back to Google] {e}");
-                self.fallback_notice = Some(format!("{e} | used Google for this line"));
-                (self.fallback.translate(key)?, false)
+                let primary_ms = started.elapsed().as_millis();
+                let fallback_started = Instant::now();
+                let result = self.fallback.translate(key);
+                self.report = self.fallback.report();
+                self.report.fallback = true;
+                self.report.attempts += 1;
+                self.report.primary_ms = primary_ms;
+                self.report.fallback_ms = fallback_started.elapsed().as_millis();
+                // Yedek başarısızsa kullanıcıya çeviri yapılmış gibi bilgi verilmez.
+                self.fallback_notice = Some(if result.is_ok() {
+                    format!("{e} | Google fallback succeeded")
+                } else {
+                    format!("{e} | Google fallback also failed")
+                });
+                (result?, false)
             }
         };
 
@@ -763,4 +945,211 @@ pub fn is_same_subtitle(curr: &str, prev: &str) -> bool {
     }
 
     false
+}
+
+#[cfg(test)]
+mod report_tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+
+    /// Yerel HTTP yanıtları gerçek çeviri/yeniden deneme yollarını dış ağa çıkmadan çalıştırır.
+    fn server(responses: Vec<(u16, &'static str)>) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        let worker = thread::spawn(move || {
+            listener.set_nonblocking(true).unwrap();
+            for (status, body) in responses {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(Instant::now() < deadline, "Test request did not arrive");
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(error) => panic!("{error}"),
+                    }
+                };
+                // Windows kabul edilen sokette dinleyicinin kilitlemeyen kipini
+                // devralabilir; gövdenin tamamı gelmeden okuma hata vermemelidir.
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0; 1024];
+                loop {
+                    let size = stream.read(&mut buffer).unwrap();
+                    if size == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..size]);
+                    if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&request[..end]).to_lowercase();
+                        let length = headers
+                            .lines()
+                            .find_map(|line| {
+                                line.strip_prefix("content-length:")
+                                    .and_then(|n| n.trim().parse::<usize>().ok())
+                            })
+                            .unwrap_or(0);
+                        if request.len() >= end + 4 + length {
+                            break;
+                        }
+                    }
+                }
+                write!(stream, "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+        });
+        (address, worker)
+    }
+
+    fn google_at(base: String) -> GoogleTranslator {
+        let mut translator = GoogleTranslator::new("en", "tr").unwrap();
+        translator.client = Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        translator.test_base_url = Some(base);
+        translator
+    }
+
+    /// Başarılı alternatif adresin seçimi ile önbelleğin sıfır denemesi birlikte doğrulanır.
+    #[test]
+    fn google_records_endpoint_attempts_and_cache_without_stale_metadata() {
+        let (base, worker) = server(vec![
+            (500, "{}"),
+            (200, r#"[[["Merhaba"]]]"#),
+            (200, r#"[[["Dünya"]]]"#),
+        ]);
+        let mut translator = google_at(base);
+        assert_eq!(translator.translate("Hello").unwrap(), "Merhaba");
+        assert_eq!(translator.report().endpoint.as_deref(), Some("gtx"));
+        assert_eq!(translator.report().attempts, 2);
+        assert_eq!(translator.translate("World").unwrap(), "Dünya");
+        assert_eq!(translator.report().attempts, 1);
+        assert_eq!(translator.translate("Hello").unwrap(), "Merhaba");
+        assert!(translator.report().cached);
+        assert_eq!(translator.report().attempts, 0);
+        assert!(translator.report().endpoint.is_none());
+        worker.join().unwrap();
+    }
+
+    /// Ana motor hatasından sonra Google sonucu ana motor önbelleğine/bağlamına giremez.
+    #[test]
+    fn fallback_reports_real_provider_and_does_not_pollute_primary_history() {
+        let (base, worker) = server(vec![
+            (500, "{}"),
+            (200, r#"["Merhaba"]"#),
+            (200, r#"{"choices":[{"message":{"content":"Selam"}}]}"#),
+        ]);
+        let mut translator =
+            OpenAiCompatTranslator::new(base.clone(), None, "same-model".into(), "en", "tr")
+                .unwrap();
+        translator.client = Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        translator.fallback = google_at(base);
+        assert_eq!(translator.translate("Hello").unwrap(), "Merhaba");
+        let report = translator.report();
+        assert_eq!(report.engine, "google");
+        assert!(report.fallback);
+        assert_eq!(report.attempts, 2);
+        assert!(translator.cache.is_empty());
+        assert!(translator.history.is_empty());
+        assert!(translator.take_notice().unwrap().contains("succeeded"));
+        assert_eq!(translator.translate("Hello").unwrap(), "Selam");
+        assert_eq!(translator.report().engine, "openai-compat");
+        assert_eq!(translator.report().model, "same-model");
+        assert!(!translator.report().fallback);
+        assert_eq!(translator.history.len(), 1);
+        assert_eq!(translator.translate("Hello").unwrap(), "Selam");
+        assert!(translator.report().cached);
+        assert_eq!(translator.report().attempts, 0);
+        worker.join().unwrap();
+    }
+
+    /// Her iki taraf da hatalıysa başarı bildirimi ve önbellek kaydı üretilmez.
+    #[test]
+    fn failed_fallback_is_reported_as_failure() {
+        let (base, worker) = server(vec![(500, "{}"), (500, "{}"), (500, "{}"), (500, "{}")]);
+        let mut translator =
+            OpenAiCompatTranslator::new(base.clone(), None, "model".into(), "en", "tr").unwrap();
+        translator.client = Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        translator.fallback = google_at(base);
+        assert!(translator.translate("Hello").is_err());
+        assert!(translator.take_notice().unwrap().contains("also failed"));
+        assert_eq!(translator.report().attempts, 4);
+        assert!(translator.history.is_empty());
+        assert!(translator.cache.is_empty());
+        worker.join().unwrap();
+    }
+
+    /// Üç LLM motorunun da Google önbelleği ve sonrasında kendi önbelleği doğru etiketlenir.
+    #[test]
+    fn all_llm_backends_clear_fallback_metadata_on_the_next_call() {
+        let mut gemini =
+            GeminiTranslator::new("invalid\nkey".into(), "gemini-model".into(), "en", "tr")
+                .unwrap();
+        let mut groq =
+            GroqTranslator::new("invalid\nkey".into(), "qwen-model".into(), "en", "tr").unwrap();
+        let mut custom = OpenAiCompatTranslator::new(
+            "http://127.0.0.1:1".into(),
+            Some("invalid\nkey".into()),
+            "custom-model".into(),
+            "en",
+            "tr",
+        )
+        .unwrap();
+        gemini
+            .fallback
+            .cache
+            .insert("Hello".into(), "Merhaba".into());
+        groq.fallback.cache.insert("Hello".into(), "Merhaba".into());
+        custom
+            .fallback
+            .cache
+            .insert("Hello".into(), "Merhaba".into());
+        gemini.cache.insert("Goodbye".into(), "Hoşça kal".into());
+        groq.cache.insert("Goodbye".into(), "Hoşça kal".into());
+        custom.cache.insert("Goodbye".into(), "Hoşça kal".into());
+        let mut engines: Vec<Box<dyn Translator>> =
+            vec![Box::new(gemini), Box::new(groq), Box::new(custom)];
+        for engine in &mut engines {
+            assert_eq!(engine.translate("Hello").unwrap(), "Merhaba");
+            assert!(engine.report().fallback);
+            assert!(engine.report().cached);
+            assert_eq!(engine.report().engine, "google");
+            assert_eq!(engine.report().attempts, 1);
+            assert_eq!(engine.translate("Goodbye").unwrap(), "Hoşça kal");
+            assert_eq!(engine.report().engine, engine.name());
+            assert!(!engine.report().fallback);
+            assert!(engine.report().cached);
+            assert_eq!(engine.report().attempts, 0);
+            assert!(engine.take_notice().is_none());
+        }
+    }
+
+    /// İki satırlık mevcut bağlam davranışı kalitenin korunması için sabitlenir.
+    #[test]
+    fn prompt_keeps_the_last_two_context_lines() {
+        let history = VecDeque::from([
+            ("one".into(), "bir".into()),
+            ("two".into(), "iki".into()),
+            ("three".into(), "üç".into()),
+        ]);
+        assert_eq!(
+            format_user_subtitle_prompt(&history, "four"),
+            "Context:\ntwo=>iki\nthree=>üç\nText: four"
+        );
+    }
 }

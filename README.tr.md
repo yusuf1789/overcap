@@ -2,6 +2,8 @@
 
 [English documentation: README.md](README.md)
 
+[Geliştirme fikirleri ve yol haritası](ROADMAP.tr.md)
+
 Windows için genel amaçlı, düşük gecikmeli canlı oyun ve video altyazı çevirici.
 
 Ekranda seçilen altyazı bölgesini yerleşik `Windows.Media.Ocr` ile okur, seçilen çeviri motoruyla (`Groq` / `Gemini` / `Google Translate`) çevirir ve çevrilmiş metni orijinal altyazının **tam üstüne** yakalamadan hariç tutma bayraklı (`WDA_EXCLUDEFROMCAPTURE`) şeffaf bir Win32 overlay penceresiyle çizer.
@@ -46,9 +48,33 @@ PC'de Borderless Windowed oyun/video testlerinde (Groq `qwen/qwen3.8-27b`):
 | GDI `BitBlt` + parlak piksel farkı | `2 - 6 ms` |
 | 2x Upscale + `Windows.Media.Ocr` | `20 - 50 ms` |
 | Groq (`qwen/qwen3.8-27b`, kalıcı TLS) | `130 - 250 ms` |
-| **Toplam (yakalama -> ekranda çeviri)** | **`~160 - 300 ms`** |
+| **Toplam (yakalama -> çeviri sonucunun hazır olması)** | **`~160 - 300 ms`** |
 
 *Not: Aynı metin önbellekten döndüğünde toplam süre `~30 - 55 ms` civarındadır.*
+
+---
+
+## Oyun İçi Çeviri Geçmişi
+
+`Ctrl + Shift + L`, son **15 hedef çeviriyi** gösteren geçmiş panelini açar/kapatır. Aynı işlev Live Log sekmesindeki düğmeden de kullanılabilir. Panel eskiden yeniye sıralanır ve her açılışta en yeni satıra gider.
+
+Fare tekerleğiyle veya panel açıkken `Ctrl + Shift + PageUp / PageDown` ile kaydırın. Yukarıda eski bir repliği okurken yeni çeviriler konumu değiştirmez; en alttaysanız yeni satırlar takip edilir. Paneli sağ üstteki `X`, sağ tık veya açma kısayoluyla kapatabilirsiniz.
+
+Panel oyundan odak almaz ve OCR yakalamasından hariçtir; çeviri ve normal altyazı akışı devam eder. Fare etkileşimi panelin kendi alanında kullanılır. Geçmiş yalnızca mevcut oturumda bellekte tutulur; uygulama kapanınca veya Live Log temizlenince silinir. Panelin başlık ve yardım dili EN/TR seçimini izler.
+
+---
+
+## Motor Durumu ve Gecikme Teşhisi
+
+Engine ekranı seçilen motoru, gerçekten başlatılan motoru ve son sonucu üreten motoru ayrı gösterir. Anahtar eksikliği veya geçici API hatasında Google yedeğine geçiş görünür kalır. `Save & Reload Engine`, önce ayarları kaydeder; hazır durumu işçi yeniden yüklemeyi tamamlayınca güncellenir. Anahtar rozetleri ilgili ortam değişkenini de hesaba katar.
+
+Kullanılan `config.json` yolu Engine ekranındadır. Çalıştırılabilir dosyanın yanındaki dosya önceliklidir; çalışma klasöründeki ikinci dosya kullanılmıyorsa ayrıca gösterilir. Dosyalar otomatik birleştirilmez.
+
+Live Log; yakalama/OCR, OCR sonrası bekleme, çeviri ve toplam sürelerini milisaniye olarak gösterir. Gerçek motor/model, önbellek, yedek kullanımı ve istek denemeleri de kaydedilir. Çeviri süresi başarısız ana istek ile varsa Google yedeği denemelerini kapsar. Toplam süre Remote Play aktarımını, yakalamadan önceki tarama aralığını ve sonucun ekrana çizilmesini içermez.
+
+Profiles & OCR içindeki yerel OCR teşhis kaydı her açılışta kapalıdır. Açıldığında, OCR yapılan karelerden en fazla dört örnek/saniye alınır; kullanılan ayar dosyasının yanındaki `ocr-diagnostics` klasöründe en fazla 60 BMP/JSON çifti tutulur. JSON; OCR metni, önceki metin, kaynak sınırları, tekrar filtresi kararı ve o anda gösterilen overlay metnini içerir. Yavaş diskte örnekler atlanır; çeviri disk yazımını beklemez. Kayıtlar yereldir ve Git tarafından yok sayılır. Kaydı kapatmak mevcut dosyaları silmez.
+
+Tekrarlı çeviri incelenirken aynı video bölümü overlay açık ve kapalı çalıştırılarak BMP görüntüleri karşılaştırılabilir. Bu teşhis modu çeviri promptunu veya tekrar filtresinin eşiklerini değiştirmez.
 
 ---
 
@@ -113,6 +139,8 @@ veya doğrudan:
 
 | Kısayol | İşlev |
 |---|---|
+| `Ctrl + Shift + L` | Son 15 çeviriyi aç / kapat |
+| `Ctrl + Shift + PageUp / PageDown` | Geçmiş açıkken eski / yeni repliklere kaydır |
 | `Ctrl + Shift + A` | Overcap kontrol merkezi penceresini aç / odakla |
 | `Ctrl + Shift + S` | Altyazı bölgesini anında yeniden seç |
 | `Ctrl + Shift + H` | Overlay'i geçici gizle / duraklat |
@@ -137,6 +165,7 @@ veya doğrudan:
 - `src/ocr.rs` — `Windows.Media.Ocr` sarmalayıcısı, satır sıralama ve `BoundingRect` hesabı.
 - `src/translator.rs` — `Translator` trait'i (`GroqTranslator`, `GeminiTranslator`, `GoogleTranslator`), önbellek ve akıllı tekrar filtresi.
 - `src/render.rs` — Piksel başına alfa ile overlay çizimi: şeffaflaştırılabilir arka plan kutusu, yazı konturu ve gölgesi, her zaman opak yazı.
+- `src/history.rs` — Son 15 çeviri, odak almayan Win32 geçmiş paneli ve kaydırma.
 - `src/overlay.rs` — `WDA_EXCLUDEFROMCAPTURE` + click-through Win32 overlay, dinamik Auto-Fit, uygulama başına stil, sistem tepsisi yönlendirmesi ve global kısayollar.
 - `src/selector.rs` — High-DPI, çoklu monitör uyumlu Win32 bölge seçici.
 - `src/gui.rs` — Yerel `eframe`/`egui` masaüstü kontrol merkezi ve canlı önizleme arayüzü.

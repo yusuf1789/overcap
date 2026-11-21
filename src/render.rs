@@ -139,6 +139,18 @@ fn bitmap_info(w: i32, h: i32) -> BITMAPINFO {
 /// Draws `text` as white-on-black antialiased glyphs into a `w` x `h` coverage mask,
 /// centered inside the padding the same way the overlay lays it out.
 pub fn render_text_mask(text: &str, style: &OverlayStyle, w: i32, h: i32) -> Mask {
+    render_text_mask_aligned(text, style, w, h, true)
+}
+
+/// Geçmişte uzun paragraflar soldan okunur; altyazının mevcut ortalama
+/// davranışı ayrı giriş noktasıyla aynen korunur.
+fn render_text_mask_aligned(
+    text: &str,
+    style: &OverlayStyle,
+    w: i32,
+    h: i32,
+    centered: bool,
+) -> Mask {
     if w <= 0 || h <= 0 {
         return Mask::new(0, 0);
     }
@@ -187,11 +199,16 @@ pub fn render_text_mask(text: &str, style: &OverlayStyle, w: i32, h: i32) -> Mas
             right: (w - pad_x).max(pad_x + 10),
             bottom: 0,
         };
+        let alignment = if centered {
+            DT_CENTER
+        } else {
+            Default::default()
+        };
         let text_h = DrawTextW(
             hdc,
             &mut wide,
             &mut calc_rect,
-            DT_CENTER | DT_WORDBREAK | DT_NOPREFIX | DT_CALCRECT,
+            alignment | DT_WORDBREAK | DT_NOPREFIX | DT_CALCRECT,
         );
         let top_y = ((h - text_h) / 2).max(pad_y);
         let mut draw_rect = RECT {
@@ -204,7 +221,7 @@ pub fn render_text_mask(text: &str, style: &OverlayStyle, w: i32, h: i32) -> Mas
             hdc,
             &mut wide,
             &mut draw_rect,
-            DT_CENTER | DT_WORDBREAK | DT_NOPREFIX,
+            alignment | DT_WORDBREAK | DT_NOPREFIX,
         );
         let _ = GdiFlush();
 
@@ -347,6 +364,20 @@ pub fn compose(
 /// Renders the complete overlay frame (`w` x `h`) for `text` in `style`.
 pub fn render_overlay(text: &str, style: &OverlayStyle, w: i32, h: i32) -> Vec<u8> {
     let text_mask = render_text_mask(text, style, w, h);
+    render_with_mask(style, w, h, text_mask)
+}
+
+/// Aynı premultiplied BGRA çizicisi geçmiş panelinin sola hizalı metnini de üretir.
+pub fn render_history_text(text: &str, style: &OverlayStyle, w: i32, h: i32) -> Vec<u8> {
+    render_with_mask(
+        style,
+        w,
+        h,
+        render_text_mask_aligned(text, style, w, h, false),
+    )
+}
+
+fn render_with_mask(style: &OverlayStyle, w: i32, h: i32, text_mask: Mask) -> Vec<u8> {
     let outline_width = style.outline_width.clamp(0, MAX_OUTLINE_WIDTH);
     let outline_mask = (outline_width > 0).then(|| dilate(&text_mask, outline_width));
 

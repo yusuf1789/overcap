@@ -8,7 +8,7 @@ use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, PAINTSTRUCT};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT,
-    VK_A, VK_DOWN, VK_H, VK_Q, VK_S, VK_UP,
+    VK_A, VK_DOWN, VK_H, VK_L, VK_Q, VK_S, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyWindow, DispatchMessageW, GetMessageW,
@@ -32,6 +32,8 @@ const WM_APP_STYLE: u32 = WM_APP + 2;
 const WM_APP_RESELECT: u32 = WM_APP + 3;
 const WM_APP_TOGGLE_PAUSE: u32 = WM_APP + 4;
 const WM_APP_QUIT: u32 = WM_APP + 5;
+const WM_APP_HISTORY_TOGGLE: u32 = WM_APP + 6;
+const WM_APP_HISTORY_REFRESH: u32 = WM_APP + 7;
 
 const MAX_LOG_ENTRIES: usize = 100;
 const MAX_NOTICES: usize = 50;
@@ -43,15 +45,30 @@ const HK_RESELECT: i32 = 3;
 const HK_FONT_UP: i32 = 4;
 const HK_FONT_DOWN: i32 = 5;
 const HK_SETTINGS: i32 = 6;
+const HK_HISTORY: i32 = 7;
 
 #[derive(Debug, Clone)]
 pub struct LogEntry {
     pub timestamp: String,
     pub total_ms: u128,
     pub ocr_ms: u128,
+    /// Bekleme, OCR tamamlandıktan çeviri çağrısının başlamasına kadar ölçülür.
+    pub wait_ms: u128,
+    pub translation_ms: u128,
+    pub report: crate::translator::TranslationReport,
     pub engine: String,
     pub src: String,
     pub dst: String,
+}
+
+/// Kaydedilen tercihten bağımsız gerçek işçi durumu; model anahtarı içermez.
+#[derive(Clone, Debug, Default)]
+pub struct EngineStatus {
+    pub ready: String,
+    pub model: String,
+    pub loading: bool,
+    pub message: Option<String>,
+    pub last_result: Option<crate::translator::TranslationReport>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -96,13 +113,28 @@ pub struct OverlayHandle {
     pub stop_flag: Arc<AtomicBool>,
     pub gui_open_requested: Arc<AtomicBool>,
     pub engine_reload_requested: Arc<AtomicBool>,
+    /// Nesil sayacı, motor değişirken devam eden eski sonuçların sunulmasını engeller.
+    pub engine_revision: Arc<AtomicU64>,
+    pub engine_status: Arc<Mutex<EngineStatus>>,
+    pub ocr_diagnostics: Arc<AtomicBool>,
     pub last_latency_ms: Arc<AtomicU64>,
     pub logs: Arc<Mutex<VecDeque<LogEntry>>>,
+    /// Oyun içi görünüm yalnızca son 15 hedef metni tutar; diske yazılmaz.
+    pub history: Arc<Mutex<crate::history::HistoryBuffer>>,
+    pub history_visible: Arc<AtomicBool>,
+    pub history_turkish: Arc<AtomicBool>,
     notices: Arc<Mutex<VecDeque<Notice>>>,
     next_notice_id: Arc<AtomicU64>,
 }
 
 impl OverlayHandle {
+    /// Teşhis yalnızca zaten gösterilen metnin bir kopyasını alır.
+    pub fn snapshot_text(&self) -> String {
+        self.state
+            .lock()
+            .map(|s| s.text.clone())
+            .unwrap_or_default()
+    }
     fn post_msg(&self, msg: u32) {
         if let Ok(raw) = self.hwnd_raw.lock() {
             if *raw != 0 {
@@ -294,6 +326,9 @@ impl OverlayHandle {
     }
 
     pub fn push_log(&self, entry: LogEntry) {
+        if let Ok(mut history) = self.history.lock() {
+            history.push(entry.timestamp.clone(), entry.dst.clone());
+        }
         self.last_latency_ms
             .store(entry.total_ms as u64, Ordering::SeqCst);
         if let Ok(mut logs) = self.logs.lock() {
@@ -302,6 +337,8 @@ impl OverlayHandle {
             }
             logs.push_back(entry);
         }
+        // Çizim yalnızca Win32 işçisinde yapılır; ağ işçisi pencereyi beklemez.
+        self.post_msg(WM_APP_HISTORY_REFRESH);
     }
 
     pub fn recent_logs(&self) -> Vec<LogEntry> {
@@ -314,6 +351,21 @@ impl OverlayHandle {
     pub fn clear_logs(&self) {
         if let Ok(mut logs) = self.logs.lock() {
             logs.clear();
+        }
+        if let Ok(mut history) = self.history.lock() {
+            history.clear();
+        }
+        self.post_msg(WM_APP_HISTORY_REFRESH);
+    }
+
+    /// Arayüz ve global kısayol aynı aç/kapat yolunu kullanır.
+    pub fn toggle_history(&self) {
+        self.post_msg(WM_APP_HISTORY_TOGGLE);
+    }
+
+    pub fn set_history_language(&self, turkish: bool) {
+        if self.history_turkish.swap(turkish, Ordering::SeqCst) != turkish {
+            self.post_msg(WM_APP_HISTORY_REFRESH);
         }
     }
 
@@ -382,7 +434,70 @@ impl OverlayHandle {
     }
 
     pub fn request_engine_reload(&self) {
+        // Durum kilidi nesil kontrolüyle aynı sınırdadır; eski işçi hazır
+        // bilgisini yeni bir yenileme isteğinin üzerine yazamaz.
+        if let Ok(mut status) = self.engine_status.lock() {
+            self.engine_revision.fetch_add(1, Ordering::SeqCst);
+            status.loading = true;
+            status.message = None;
+            status.last_result = None;
+            self.last_latency_ms.store(0, Ordering::SeqCst);
+        }
         self.engine_reload_requested.store(true, Ordering::SeqCst);
+    }
+
+    /// İşçi yalnızca başladığı nesil hâlâ geçerliyse durumunu yayımlar.
+    pub fn publish_engine_status(&self, revision: u64, status: EngineStatus) {
+        if let Ok(mut current) = self.engine_status.lock() {
+            if self.engine_revision.load(Ordering::SeqCst) == revision {
+                *current = status;
+            }
+        }
+    }
+
+    pub fn snapshot_engine_status(&self) -> EngineStatus {
+        self.engine_status
+            .lock()
+            .map(|s| s.clone())
+            .unwrap_or_default()
+    }
+
+    /// Nesil doğrulaması, son sonuç ve log yayını aynı kilit altında yapılır.
+    /// Böylece tam sonuç gelirken yapılan yenileme eski satırı geri getiremez.
+    pub fn publish_translation(
+        &self,
+        revision: u64,
+        entry: LogEntry,
+        bounds: Option<SourceBounds>,
+    ) -> bool {
+        let Ok(mut status) = self.engine_status.lock() else {
+            return false;
+        };
+        if self.engine_revision.load(Ordering::SeqCst) != revision || status.loading {
+            return false;
+        }
+        status.last_result = Some(entry.report.clone());
+        // Geliştirme konsolu da arayüzle aynı gerçek sağlayıcı ve süreleri kullanır.
+        println!(
+            "[{} ms | OCR {} | Wait {} | Translate {} ms | {} {}{}{}] {} -> {}",
+            entry.total_ms,
+            entry.ocr_ms,
+            entry.wait_ms,
+            entry.translation_ms,
+            entry.engine,
+            entry.report.model,
+            if entry.report.cached { " | cache" } else { "" },
+            if entry.report.fallback {
+                " | fallback"
+            } else {
+                ""
+            },
+            entry.src,
+            entry.dst
+        );
+        self.set_subtitle(entry.dst.clone(), bounds);
+        self.push_log(entry);
+        true
     }
 
     pub fn trigger_reselect(&self) {
@@ -659,6 +774,14 @@ unsafe extern "system" fn overlay_wnd_proc(
             let _ = handle_toggle_pause(hwnd);
             LRESULT(0)
         }
+        WM_APP_HISTORY_TOGGLE => {
+            crate::history::toggle();
+            LRESULT(0)
+        }
+        WM_APP_HISTORY_REFRESH => {
+            crate::history::refresh();
+            LRESULT(0)
+        }
         WM_APP_QUIT => {
             handle_quit(hwnd);
             LRESULT(0)
@@ -718,6 +841,7 @@ unsafe extern "system" fn overlay_wnd_proc(
                         }
                     }
                 }
+                HK_HISTORY => crate::history::toggle(),
                 HK_SETTINGS => {
                     println!("[Hotkey] Ctrl+Shift+A -> Opening Overcap window...");
                     handle_open_gui();
@@ -741,6 +865,8 @@ unsafe extern "system" fn overlay_wnd_proc(
             let _ = UnregisterHotKey(hwnd, HK_FONT_UP);
             let _ = UnregisterHotKey(hwnd, HK_FONT_DOWN);
             let _ = UnregisterHotKey(hwnd, HK_SETTINGS);
+            let _ = UnregisterHotKey(hwnd, HK_HISTORY);
+            crate::history::shutdown();
             tray::remove_tray_icon(hwnd);
             if let Ok(mut icon_guard) = TRAY_ICON.lock() {
                 if *icon_guard != 0 {
@@ -773,8 +899,17 @@ pub fn create_handle(config: AppConfig, region: Region) -> OverlayHandle {
         stop_flag: Arc::new(AtomicBool::new(false)),
         gui_open_requested: Arc::new(AtomicBool::new(false)),
         engine_reload_requested: Arc::new(AtomicBool::new(false)),
+        engine_revision: Arc::new(AtomicU64::new(0)),
+        engine_status: Arc::new(Mutex::new(EngineStatus {
+            loading: true,
+            ..Default::default()
+        })),
+        ocr_diagnostics: Arc::new(AtomicBool::new(false)),
         last_latency_ms: Arc::new(AtomicU64::new(0)),
         logs: Arc::new(Mutex::new(VecDeque::with_capacity(MAX_LOG_ENTRIES))),
+        history: Arc::new(Mutex::new(crate::history::HistoryBuffer::default())),
+        history_visible: Arc::new(AtomicBool::new(false)),
+        history_turkish: Arc::new(AtomicBool::new(false)),
         notices: Arc::new(Mutex::new(VecDeque::with_capacity(MAX_NOTICES))),
         next_notice_id: Arc::new(AtomicU64::new(0)),
     }
@@ -839,6 +974,20 @@ pub fn run_overlay_loop(handle: OverlayHandle) -> Result<()> {
         let _ = RegisterHotKey(hwnd, HK_FONT_UP, mods, VK_UP.0 as u32);
         let _ = RegisterHotKey(hwnd, HK_FONT_DOWN, mods, VK_DOWN.0 as u32);
         let _ = RegisterHotKey(hwnd, HK_SETTINGS, mods, VK_A.0 as u32);
+        if let Err(error) = RegisterHotKey(hwnd, HK_HISTORY, mods, VK_L.0 as u32) {
+            handle.push_notice(
+                NoticeLevel::Warning,
+                "history",
+                format!("Ctrl+Shift+L unavailable: {error}. Open history from Live Log."),
+            );
+        }
+        if let Err(error) = crate::history::initialize(handle.clone()) {
+            handle.push_notice(
+                NoticeLevel::Error,
+                "history",
+                format!("History could not start: {error}"),
+            );
+        }
 
         if let Ok(hicon) = tray::create_hicon(32) {
             if tray::add_tray_icon(hwnd, hicon).is_ok() {
@@ -862,4 +1011,67 @@ pub fn run_overlay_loop(handle: OverlayHandle) -> Result<()> {
 
     handle.stop_flag.store(true, Ordering::SeqCst);
     Ok(())
+}
+
+#[cfg(test)]
+mod engine_status_tests {
+    use super::*;
+
+    /// Gerçek pencere oluşturmadan işçi/arayüz arasındaki yenileme yarışını doğrular.
+    #[test]
+    fn reload_rejects_old_status_and_old_translation() {
+        let handle = create_handle(
+            AppConfig::default(),
+            Region {
+                left: 0,
+                top: 0,
+                width: 100,
+                height: 50,
+            },
+        );
+        handle.publish_engine_status(
+            0,
+            EngineStatus {
+                ready: "groq".into(),
+                loading: false,
+                ..Default::default()
+            },
+        );
+        handle.request_engine_reload();
+        handle.publish_engine_status(
+            0,
+            EngineStatus {
+                ready: "google".into(),
+                ..Default::default()
+            },
+        );
+        assert!(handle.snapshot_engine_status().loading);
+        assert_eq!(handle.snapshot_engine_status().ready, "groq");
+        let entry = LogEntry {
+            timestamp: String::new(),
+            total_ms: 20,
+            ocr_ms: 5,
+            wait_ms: 5,
+            translation_ms: 10,
+            report: Default::default(),
+            engine: "groq".into(),
+            src: "old".into(),
+            dst: "eski".into(),
+        };
+        assert!(!handle.publish_translation(0, entry.clone(), None));
+        assert!(handle.recent_logs().is_empty());
+        assert!(handle.snapshot_text().is_empty());
+        handle.publish_engine_status(
+            1,
+            EngineStatus {
+                ready: "google".into(),
+                ..Default::default()
+            },
+        );
+        assert!(handle.publish_translation(1, entry, None));
+        assert_eq!(handle.snapshot_text(), "eski");
+        handle.request_engine_reload();
+        assert!(handle.snapshot_engine_status().last_result.is_none());
+        assert_eq!(handle.last_latency_ms.load(Ordering::SeqCst), 0);
+    }
 }

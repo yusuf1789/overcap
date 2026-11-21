@@ -2,6 +2,8 @@
 
 [Türkçe dokümantasyon için README.tr.md](README.tr.md)
 
+[Improvement ideas and roadmap](ROADMAP.md)
+
 General-purpose, low-latency live game and video subtitle translator overlay for Windows.
 
 Overcap captures a user-selected screen region via GDI `BitBlt`, extracts text and word bounding coordinates using the built-in `Windows.Media.Ocr` engine, translates it through your chosen backend (`Groq` / `Gemini` / `Google Translate`), and renders the translation **directly over** the original subtitle using a capture-excluded (`WDA_EXCLUDEFROMCAPTURE`) transparent Win32 overlay window.
@@ -46,9 +48,31 @@ Tested on Windows in Borderless Windowed game/video playback (Groq `qwen/qwen3.8
 | GDI `BitBlt` + bright-pixel diff | `2 - 6 ms` |
 | 2x Upscale + `Windows.Media.Ocr` | `20 - 50 ms` |
 | Groq (`qwen/qwen3.8-27b`, persistent TLS) | `130 - 250 ms` |
-| **Total (capture -> translated overlay)** | **`~160 - 300 ms`** |
+| **Total (capture -> translation result ready)** | **`~160 - 300 ms`** |
 
 *Note: Cache hits on repeated lines complete in `~30 - 55 ms`.*
+
+---
+
+## In-Game Translation History
+
+`Ctrl + Shift + L` toggles a history panel showing the **last 15 translated lines** in the target language. A button in Live Log provides the same action. Entries run from oldest to newest; opening the panel starts at the latest line.
+
+Scroll with the mouse wheel or, while the panel is open, `Ctrl + Shift + PageUp / PageDown`. Incoming translations preserve your reading position when browsing older lines; at the bottom, the panel follows new entries. Close it using the top-right `X`, a right-click, or the toggle hotkey.
+
+The panel does not take game focus and is excluded from OCR capture. Translation and the normal subtitle overlay continue running. Mouse interaction is handled within the panel's own area. History stays in memory for the current session only and is cleared on exit or when Live Log is cleared. Panel labels follow the EN/TR UI selection.
+
+---
+
+## Engine Status and Latency Diagnostics
+
+The Engine tab distinguishes the selected engine, initialized engine, and provider of the last successful result. Missing-key and per-request Google fallbacks stay visible. Saving requests a reload; readiness is reported only after the worker finishes. Key badges also recognize the corresponding environment variable.
+
+The active `config.json` path is shown, along with any ignored duplicate. The file beside the executable takes precedence over the working-directory file. Files are never merged automatically.
+
+Live Log separates capture/OCR, post-OCR wait, translation, and total milliseconds. It records the actual provider/model, cache hits, fallback use, and request attempts. Translation time includes a failed primary request and any Google fallback attempts. Total time excludes Remote Play, polling before capture, and final display presentation.
+
+Profiles & OCR offers optional local OCR recording, off on every launch. Up to four OCR samples per second are written asynchronously beside the active settings file in `ocr-diagnostics`, retaining at most 60 BMP/JSON pairs. Metadata includes recognized/previous text, source bounds, duplicate-filter decision, and current overlay text. Samples are dropped when the writer is busy. Files stay local and are ignored by Git; disabling recording does not delete existing files. Compare the same video with the overlay on/off to investigate repeated OCR without changing translation prompts or duplicate thresholds.
 
 ---
 
@@ -113,6 +137,8 @@ See [config.example.json](config.example.json) for a configuration template. `co
 
 | Hotkey | Action |
 |---|---|
+| `Ctrl + Shift + L` | Show / hide the last 15 translations |
+| `Ctrl + Shift + PageUp / PageDown` | Scroll to older / newer history entries while open |
 | `Ctrl + Shift + A` | Open / focus Overcap control center window |
 | `Ctrl + Shift + S` | Re-select subtitle capture region |
 | `Ctrl + Shift + H` | Toggle overlay visibility / pause |
@@ -137,6 +163,7 @@ See [config.example.json](config.example.json) for a configuration template. `co
 - `src/ocr.rs` — `Windows.Media.Ocr` wrapper, line ordering, and `SourceBounds` calculation.
 - `src/translator.rs` — `Translator` trait (`GroqTranslator`, `GeminiTranslator`, `GoogleTranslator`), cache, and smart duplicate filter.
 - `src/render.rs` — Per-pixel-alpha overlay compositing: translucent background box, text outline and shadow, always-opaque text.
+- `src/history.rs` — Last-15 translation buffer, non-activating Win32 history panel, and scrolling.
 - `src/overlay.rs` — `WDA_EXCLUDEFROMCAPTURE` + click-through Win32 overlay, dynamic Auto-Fit, per-app styles, tray dispatch, and global hotkeys.
 - `src/selector.rs` — High-DPI, multi-monitor Win32 region selector.
 - `src/gui.rs` — Native `eframe`/`egui` desktop control center and live preview UI.

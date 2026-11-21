@@ -435,21 +435,9 @@ impl OvercapApp {
             groq_key_input: String::new(),
             gemini_key_input: String::new(),
             custom_key_input: String::new(),
-            has_groq_key: cfg
-                .groq_api_key
-                .as_deref()
-                .map(|s| !s.trim().is_empty())
-                .unwrap_or(false),
-            has_gemini_key: cfg
-                .gemini_api_key
-                .as_deref()
-                .map(|s| !s.trim().is_empty())
-                .unwrap_or(false),
-            has_custom_key: cfg
-                .custom_api_key
-                .as_deref()
-                .map(|s| !s.trim().is_empty())
-                .unwrap_or(false),
+            has_groq_key: key_available(cfg.groq_api_key.as_deref(), "GROQ_API_KEY"),
+            has_gemini_key: key_available(cfg.gemini_api_key.as_deref(), "GEMINI_API_KEY"),
+            has_custom_key: key_available(cfg.custom_api_key.as_deref(), "OPENAI_API_KEY"),
             engine_status_msg: None,
             auto_profiles: cfg.auto_profiles,
             installed_ocr_langs,
@@ -603,30 +591,34 @@ impl OvercapApp {
 
         if !self.groq_key_input.trim().is_empty() {
             cfg.groq_api_key = Some(self.groq_key_input.trim().to_string());
-            self.groq_key_input.clear();
-            self.has_groq_key = true;
         }
         if !self.gemini_key_input.trim().is_empty() {
             cfg.gemini_api_key = Some(self.gemini_key_input.trim().to_string());
-            self.gemini_key_input.clear();
-            self.has_gemini_key = true;
         }
         if !self.custom_key_input.trim().is_empty() {
             cfg.custom_api_key = Some(self.custom_key_input.trim().to_string());
-            self.custom_key_input.clear();
-            self.has_custom_key = true;
         }
 
         match self.handle.update_config_and_save(cfg) {
             Ok(()) => {
+                // Kaydetme başarısızsa girilen anahtar korunur ve SET rozeti verilmez.
+                self.groq_key_input.clear();
+                self.gemini_key_input.clear();
+                self.custom_key_input.clear();
+                let saved = self.handle.snapshot_config();
+                self.has_groq_key = key_available(saved.groq_api_key.as_deref(), "GROQ_API_KEY");
+                self.has_gemini_key =
+                    key_available(saved.gemini_api_key.as_deref(), "GEMINI_API_KEY");
+                self.has_custom_key =
+                    key_available(saved.custom_api_key.as_deref(), "OPENAI_API_KEY");
                 self.handle.request_engine_reload();
                 if self.source_lang != self.last_checked_ocr_lang {
                     self.refresh_ocr_diagnostics();
                 }
                 self.engine_status_msg = Some(
                     self.t(
-                        "Saved config.json and reloaded engine.",
-                        "config.json kaydedildi ve motor yenilendi.",
+                        "Settings saved; engine reload requested.",
+                        "Ayarlar kaydedildi; motor yenileme istendi.",
                     )
                     .to_string(),
                 );
@@ -640,7 +632,24 @@ impl OvercapApp {
     fn render_top_bar(&mut self, ui: &mut egui::Ui, pal: Palette) {
         let is_paused = self.handle.is_paused();
         let latency = self.handle.last_latency_ms.load(Ordering::SeqCst);
-        let active_engine = self.handle.snapshot_config().engine;
+        // Kullanıcı tercihi yerine gerçekten hazırlanmış işçi gösterilir.
+        let runtime = self.handle.snapshot_engine_status();
+        let fallback = runtime.last_result.as_ref().is_some_and(|r| r.fallback);
+        let active_engine = if fallback {
+            format!(
+                "{} (fallback)",
+                runtime.last_result.as_ref().unwrap().engine
+            )
+        } else if runtime.ready.is_empty() {
+            "—".into()
+        } else {
+            runtime.ready.clone()
+        };
+        let running_color = if fallback || runtime.message.is_some() {
+            pal.status_amber
+        } else {
+            pal.status_green
+        };
 
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 8.0;
@@ -664,14 +673,19 @@ impl OvercapApp {
                     pal.status_red,
                     self.t("Missing OCR", "OCR Eksik").to_string(),
                 )
+            } else if runtime.loading {
+                (
+                    pal.status_amber,
+                    self.t("Preparing engine", "Motor hazirlaniyor").to_string(),
+                )
             } else if is_paused {
                 (
                     pal.status_amber,
-                    self.t("Paused", "Duraklatildi").to_string(),
+                    format!("{} · {}", self.t("Paused", "Duraklatildi"), active_engine),
                 )
             } else if latency > 0 {
                 (
-                    pal.status_green,
+                    running_color,
                     format!(
                         "{} · {} · {} ms",
                         self.t("Running", "Calisiyor"),
@@ -681,7 +695,7 @@ impl OvercapApp {
                 )
             } else {
                 (
-                    pal.status_green,
+                    running_color,
                     format!("{} · {}", self.t("Running", "Calisiyor"), active_engine),
                 )
             };
@@ -1396,6 +1410,48 @@ impl OvercapApp {
                     });
 
                 ui.add_space(10.0);
+                // Ayar kaydetme ile işçinin hazır olması farklı aşamalardır.
+                let runtime = self.handle.snapshot_engine_status();
+                ui.label(format!(
+                    "{}: {} | {}: {} {}",
+                    self.t("Selected", "Secilen"),
+                    self.engine,
+                    self.t("Active", "Aktif"),
+                    if runtime.ready.is_empty() {
+                        "—"
+                    } else {
+                        &runtime.ready
+                    },
+                    runtime.model
+                ));
+                if runtime.loading {
+                    ui.label(self.t("Preparing engine...", "Motor hazirlaniyor..."));
+                }
+                if let Some(message) = &runtime.message {
+                    ui.colored_label(pal.status_amber, message);
+                }
+                if let Some(last) = &runtime.last_result {
+                    ui.label(format!(
+                        "{}: {} {}{}{}",
+                        self.t("Last result", "Son sonuc"),
+                        last.engine,
+                        last.model,
+                        if last.cached { " · cache" } else { "" },
+                        if last.fallback { " · fallback" } else { "" }
+                    ));
+                }
+                ui.label(self.t("Settings file:", "Ayar dosyasi:"));
+                ui.label(RichText::new(AppConfig::path().display().to_string()).monospace());
+                if let Some(ignored) = AppConfig::ignored_path() {
+                    ui.colored_label(
+                        pal.status_amber,
+                        format!(
+                            "{}: {}",
+                            self.t("Ignored settings file", "Kullanilmayan ayar dosyasi"),
+                            ignored.display()
+                        ),
+                    );
+                }
                 ui.horizontal(|ui| {
                     let btn = egui::Button::new(
                         RichText::new(self.t("Save & Reload Engine", "Kaydet ve Motoru Yenile"))
@@ -1419,6 +1475,29 @@ impl OvercapApp {
         let lang = self.ui_lang;
         let active_app = self.handle.active_app();
         let cfg = self.handle.snapshot_config();
+
+        // Yerel görüntü kaydı her açılışta kapalı başlar ve açıkça etkinleştirilir.
+        let mut diagnostics = self.handle.ocr_diagnostics.load(Ordering::SeqCst);
+        if ui
+            .checkbox(
+                &mut diagnostics,
+                self.t(
+                    "Record OCR diagnostics locally (max 60 samples)",
+                    "OCR teshisini yerel kaydet (en fazla 60 ornek)",
+                ),
+            )
+            .changed()
+        {
+            self.handle
+                .ocr_diagnostics
+                .store(diagnostics, Ordering::SeqCst);
+        }
+        ui.label(self.t(
+            "Contains captured subtitle images and text. Recording starts when resumed.",
+            "Yakalanan altyazi goruntulerini ve metni icerir. Kayit devam ettirince baslar.",
+        ));
+        ui.label(RichText::new(crate::diagnostics::directory().display().to_string()).monospace());
+        ui.add_space(8.0);
 
         Frame::none()
             .fill(pal.surface_bg)
@@ -1764,6 +1843,27 @@ impl OvercapApp {
     }
 
     fn render_live_log_tab(&mut self, ui: &mut egui::Ui, pal: Palette) {
+        ui.horizontal(|ui| {
+            let visible = self.handle.history_visible.load(Ordering::SeqCst);
+            let label = if visible {
+                self.t("Hide History", "Gecmisi Gizle")
+            } else {
+                self.t("Show Last 15 Translations", "Son 15 Ceviriyi Goster")
+            };
+            if ui.button(label).clicked() {
+                self.handle.toggle_history();
+            }
+            ui.label(
+                RichText::new("Ctrl+Shift+L")
+                    .monospace()
+                    .color(pal.text_muted),
+            );
+        });
+        ui.add_space(6.0);
+        ui.label(self.t(
+            "Total: capture start to result ready; excludes Remote Play and display time.",
+            "Toplam: yakalama baslangicindan sonuc hazir olana kadar; Remote Play ve cizim haric.",
+        ));
         self.render_events_section(ui, pal);
         let logs = self.handle.recent_logs();
 
@@ -1812,13 +1912,15 @@ impl OvercapApp {
                             for entry in logs.iter().rev() {
                                 ui.label(
                                     RichText::new(format!(
-                                        "{} [{} ms | OCR {} ms | {}] {} -> {}",
-                                        entry.timestamp,
-                                        entry.total_ms,
-                                        entry.ocr_ms,
-                                        entry.engine,
-                                        entry.src,
-                                        entry.dst
+                                        "{} [{} ms | OCR {} | Wait {} | Translate {} ms | {} {}{}{} | {} attempts{} | Primary {} / Fallback {} ms] {} -> {}",
+                                        entry.timestamp, entry.total_ms, entry.ocr_ms, entry.wait_ms,
+                                        entry.translation_ms, entry.engine, entry.report.model,
+                                        if entry.report.cached { " | cache" } else { "" },
+                                        if entry.report.fallback { " | fallback" } else { "" },
+                                        entry.report.attempts,
+                                        entry.report.endpoint.as_ref().map(|s| format!(" | {s}")).unwrap_or_default(),
+                                        entry.report.primary_ms, entry.report.fallback_ms,
+                                        entry.src, entry.dst
                                     ))
                                     .font(FontId::new(11.5, FontFamily::Monospace))
                                     .color(pal.text_primary),
@@ -1851,6 +1953,8 @@ impl eframe::App for OvercapApp {
         }
 
         self.sync_from_handle_if_needed();
+        // Panel dili GUI seçimiyle birlikte değişir; hedef çeviri dili bundan bağımsızdır.
+        self.handle.set_history_language(self.ui_lang == UiLang::Tr);
 
         let pal = self.palette();
 
@@ -1877,7 +1981,7 @@ impl eframe::App for OvercapApp {
             .show(ctx, |ui| {
                 ui.label(
                     RichText::new(
-                        "Ctrl+Shift+  S: Region  |  H: Pause  |  Up/Down: Size  |  A: Window  |  Q: Quit",
+                        "Ctrl+Shift+  L: History  |  S: Region  |  H: Pause  |  Up/Down: Size  |  A: Window  |  Q: Quit",
                     )
                     .font(FontId::new(11.0, FontFamily::Monospace))
                     .color(pal.text_muted),
@@ -1932,4 +2036,12 @@ pub fn run_gui(handle: OverlayHandle, start_hidden: bool) -> Result<()> {
         Box::new(move |cc| Ok(Box::new(OvercapApp::new(cc, handle)))),
     )
     .map_err(|e| anyhow!("eframe error: {e}"))
+}
+
+/// Anahtarın değeri taşınmadan, işçiyle aynı dosya/ortam önceliği kontrol edilir.
+fn key_available(configured: Option<&str>, variable: &str) -> bool {
+    configured.is_some_and(|s| !s.trim().is_empty())
+        || std::env::var(variable)
+            .ok()
+            .is_some_and(|s| !s.trim().is_empty())
 }

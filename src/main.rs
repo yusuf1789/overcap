@@ -2,7 +2,9 @@
 
 mod capture;
 mod config;
+mod diagnostics;
 mod gui;
+mod history;
 mod ocr;
 mod overlay;
 mod profiles;
@@ -25,7 +27,9 @@ use windows::Win32::UI::HiDpi::{
 use crate::capture::{capture_region, changed_pixel_ratio, upscale_for_ocr};
 use crate::config::AppConfig;
 use crate::ocr::{SourceBounds, WinOcr};
-use crate::overlay::{create_handle, run_overlay_loop, LogEntry, NoticeLevel, OverlayHandle};
+use crate::overlay::{
+    create_handle, run_overlay_loop, EngineStatus, LogEntry, NoticeLevel, OverlayHandle,
+};
 use crate::selector::select_region;
 use crate::translator::{
     is_same_subtitle, GeminiTranslator, GoogleTranslator, GroqTranslator, OpenAiCompatTranslator,
@@ -109,6 +113,10 @@ struct TranslationJob {
     source_bounds: Option<SourceBounds>,
     captured_at: Instant,
     ocr_ms: u128,
+    /// OCR dili ve motor nesli, yenileme sırasında eski işlerin karışmasını önler.
+    source_lang: String,
+    revision: u64,
+    queued_at: Instant,
 }
 
 /// Latest-only mailbox so OCR never blocks on network translation and stale lines are skipped.
@@ -147,6 +155,10 @@ impl TranslationSlot {
                 .wait_timeout(guard, Duration::from_millis(150))
                 .ok()?;
             guard = g;
+        }
+        // Dolu kutu da yenilemeden önce tüketilmemelidir.
+        if stop_flag.load(Ordering::SeqCst) || reload_flag.load(Ordering::SeqCst) {
+            return None;
         }
         guard.take()
     }
@@ -279,12 +291,22 @@ fn translation_worker(
     latest_seq: Arc<std::sync::atomic::AtomicU64>,
     cleared_seq: Arc<std::sync::atomic::AtomicU64>,
 ) {
+    let mut revision = handle.engine_revision.load(Ordering::SeqCst);
     let init_cfg = handle.snapshot_config();
     let mut source_lang = init_cfg.source_lang.clone();
-    let mut target_lang = init_cfg.target_lang.clone();
 
     let mut translator = match build_translator(&init_cfg) {
         Ok((t, warning)) => {
+            handle.publish_engine_status(
+                revision,
+                EngineStatus {
+                    ready: t.name().into(),
+                    model: t.model().into(),
+                    loading: false,
+                    message: warning.clone(),
+                    last_result: None,
+                },
+            );
             if let Some(w) = warning {
                 handle.push_notice(NoticeLevel::Warning, "engine", w);
             }
@@ -306,16 +328,27 @@ fn translation_worker(
         "[Ready] Translation engine: {} ({} -> {})",
         translator.name(),
         source_lang,
-        target_lang
+        init_cfg.target_lang
     );
 
     while !handle.stop_flag.load(Ordering::SeqCst) {
         if handle.engine_reload_requested.swap(false, Ordering::SeqCst) {
+            revision = handle.engine_revision.load(Ordering::SeqCst);
             let cfg = handle.snapshot_config();
-            source_lang = cfg.source_lang.clone();
-            target_lang = cfg.target_lang.clone();
             match build_translator(&cfg) {
                 Ok((t, warning)) => {
+                    // Etiketler ancak yeni motor kurulunca değiştirilir.
+                    source_lang = cfg.source_lang.clone();
+                    handle.publish_engine_status(
+                        revision,
+                        EngineStatus {
+                            ready: t.name().into(),
+                            model: t.model().into(),
+                            loading: false,
+                            message: warning.clone(),
+                            last_result: None,
+                        },
+                    );
                     if let Some(w) = warning {
                         handle.push_notice(NoticeLevel::Warning, "engine", w);
                     }
@@ -324,10 +357,20 @@ fn translation_worker(
                         "[Reloaded] Translation engine: {} ({} -> {})",
                         translator.name(),
                         source_lang,
-                        target_lang
+                        cfg.target_lang
                     );
                 }
                 Err(e) => {
+                    handle.publish_engine_status(
+                        revision,
+                        EngineStatus {
+                            ready: translator.name().into(),
+                            model: translator.model().into(),
+                            loading: false,
+                            message: Some(format!("Reload failed; previous engine retained: {e}")),
+                            last_result: None,
+                        },
+                    );
                     eprintln!("[Reload ERROR] {e}");
                     handle.push_notice(
                         NoticeLevel::Error,
@@ -344,11 +387,26 @@ fn translation_worker(
         };
 
         // Drop job only if it was already superseded BEFORE we even started translating
-        if job.seq < latest_seq.load(Ordering::SeqCst) {
+        if job.seq < latest_seq.load(Ordering::SeqCst)
+            || job.revision != revision
+            || !job.source_lang.eq_ignore_ascii_case(&source_lang)
+            || handle.engine_reload_requested.load(Ordering::SeqCst)
+        {
             continue;
         }
 
+        let wait_ms = job.queued_at.elapsed().as_millis();
+        let translation_started = Instant::now();
         let result = translator.translate(&job.text);
+        let translation_ms = translation_started.elapsed().as_millis();
+        let total_ms = job.captured_at.elapsed().as_millis();
+        let report = translator.report();
+        // Devam eden eski istek iptal edilemese bile yeni motorun sonucuymuş gibi sunulmaz.
+        if revision != handle.engine_revision.load(Ordering::SeqCst)
+            || handle.engine_reload_requested.load(Ordering::SeqCst)
+        {
+            continue;
+        }
         if let Some(note) = translator.take_notice() {
             handle.push_notice(NoticeLevel::Warning, translator.name(), note);
         }
@@ -357,25 +415,21 @@ fn translation_worker(
             Ok(translated) if !translated.is_empty() => {
                 // Show translation unless subtitles were explicitly cleared/reset after this capture
                 if job.seq > cleared_seq.load(Ordering::SeqCst) {
-                    let total_ms = job.captured_at.elapsed().as_millis();
-                    println!(
-                        "[{:>4} ms | OCR {:>2} ms] {}: {}\n                     {}: {}\n",
-                        total_ms,
-                        job.ocr_ms,
-                        source_lang.to_uppercase(),
-                        job.text,
-                        target_lang.to_uppercase(),
-                        translated
+                    handle.publish_translation(
+                        revision,
+                        LogEntry {
+                            timestamp: current_hms(),
+                            total_ms,
+                            ocr_ms: job.ocr_ms,
+                            wait_ms,
+                            translation_ms,
+                            engine: report.engine.clone(),
+                            report: report.clone(),
+                            src: job.text,
+                            dst: translated.clone(),
+                        },
+                        job.source_bounds,
                     );
-                    handle.push_log(LogEntry {
-                        timestamp: current_hms(),
-                        total_ms,
-                        ocr_ms: job.ocr_ms,
-                        engine: translator.name().to_string(),
-                        src: job.text,
-                        dst: translated.clone(),
-                    });
-                    handle.set_subtitle(translated, job.source_bounds);
                 }
             }
             Ok(_) => {}
@@ -439,6 +493,8 @@ fn ocr_worker(
     let mut empty_streak: u32 = 0;
     let mut last_profile_check = Instant::now() - Duration::from_secs(1);
     let mut last_fg_app: Option<String> = None;
+    let mut last_revision = handle.engine_revision.load(Ordering::SeqCst);
+    let mut diagnostics = diagnostics::OcrDiagnostics::new(handle.clone());
 
     while !handle.stop_flag.load(Ordering::SeqCst) {
         if last_profile_check.elapsed() >= Duration::from_millis(500) {
@@ -492,6 +548,13 @@ fn ocr_worker(
             }
         }
 
+        let revision = handle.engine_revision.load(Ordering::SeqCst);
+        if revision != last_revision {
+            // Aynı altyazı yeni motora da gönderilebilsin; eski tekrar durumu sıfırlanır.
+            last_revision = revision;
+            prev_bgra = None;
+            last_src.clear();
+        }
         if handle.is_paused() {
             thread::sleep(Duration::from_millis(150));
             continue;
@@ -550,7 +613,25 @@ fn ocr_worker(
         };
 
         let clean = ocr_out.text.trim();
-        if !has_meaningful_letters(clean) {
+        let ocr_completed = Instant::now();
+        let ocr_ms = ocr_completed.duration_since(t0).as_millis();
+        let meaningful = has_meaningful_letters(clean);
+        let duplicate = !last_src.is_empty() && is_same_subtitle(clean, &last_src);
+        diagnostics.record(
+            &frame,
+            region,
+            &ocr_out,
+            &last_src,
+            ocr_ms,
+            if !meaningful {
+                "empty"
+            } else if duplicate {
+                "duplicate"
+            } else {
+                "translate"
+            },
+        );
+        if !meaningful {
             empty_streak += 1;
             if empty_streak >= 8 && !last_src.is_empty() {
                 last_src.clear();
@@ -564,13 +645,12 @@ fn ocr_worker(
 
         empty_streak = 0;
 
-        if !last_src.is_empty() && is_same_subtitle(clean, &last_src) {
+        if duplicate {
             thread::sleep(sleep_dur);
             continue;
         }
 
         last_src = clean.to_string();
-        let ocr_ms = t0.elapsed().as_millis();
         let seq = latest_seq.fetch_add(1, Ordering::SeqCst) + 1;
 
         slot.push(TranslationJob {
@@ -579,6 +659,9 @@ fn ocr_worker(
             source_bounds: ocr_out.bounds,
             captured_at: t0,
             ocr_ms,
+            source_lang: active_source_lang.clone(),
+            revision,
+            queued_at: ocr_completed,
         });
 
         thread::sleep(sleep_dur);
@@ -757,4 +840,33 @@ fn main() -> Result<()> {
 
     gui::run_gui(handle, args.minimized)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod mailbox_tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+
+    /// Dolu kutu yenileme sırasında tüketilirse iş yanlış motorla çevrilebilir.
+    #[test]
+    fn reload_preserves_latest_mailbox_job_until_worker_is_ready() {
+        let slot = TranslationSlot::new();
+        for seq in 1..=2 {
+            slot.push(TranslationJob {
+                seq,
+                text: seq.to_string(),
+                source_bounds: None,
+                captured_at: Instant::now(),
+                ocr_ms: 0,
+                source_lang: "en".into(),
+                revision: 0,
+                queued_at: Instant::now(),
+            });
+        }
+        let stop = AtomicBool::new(false);
+        let reload = AtomicBool::new(true);
+        assert!(slot.take_blocking(&stop, &reload).is_none());
+        reload.store(false, Ordering::SeqCst);
+        assert_eq!(slot.take_blocking(&stop, &reload).unwrap().seq, 2);
+    }
 }
