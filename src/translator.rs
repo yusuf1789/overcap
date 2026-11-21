@@ -7,6 +7,12 @@ use std::time::Duration;
 pub trait Translator: Send {
     fn name(&self) -> &'static str;
     fn translate(&mut self, text: &str) -> Result<String>;
+
+    /// Returns and clears a note about the last `translate` call, e.g. that the primary
+    /// backend failed and the Google fallback was used. The worker surfaces it in the GUI.
+    fn take_notice(&mut self) -> Option<String> {
+        None
+    }
 }
 
 pub struct GoogleTranslator {
@@ -87,7 +93,10 @@ impl GoogleTranslator {
                 if let Some(s) = first.as_str() {
                     return Ok(s.trim().to_string());
                 }
-                if let Some(inner) = first.as_array().and_then(|a| a.first()).and_then(|v| v.as_str())
+                if let Some(inner) = first
+                    .as_array()
+                    .and_then(|a| a.first())
+                    .and_then(|v| v.as_str())
                 {
                     return Ok(inner.trim().to_string());
                 }
@@ -220,6 +229,7 @@ pub struct GeminiTranslator {
     cache: HashMap<String, String>,
     history: VecDeque<(String, String)>,
     fallback: GoogleTranslator,
+    fallback_notice: Option<String>,
 }
 
 impl GeminiTranslator {
@@ -245,6 +255,7 @@ impl GeminiTranslator {
             cache: HashMap::new(),
             history: VecDeque::with_capacity(4),
             fallback,
+            fallback_notice: None,
         })
     }
 
@@ -312,6 +323,10 @@ impl Translator for GeminiTranslator {
         "gemini"
     }
 
+    fn take_notice(&mut self) -> Option<String> {
+        self.fallback_notice.take()
+    }
+
     fn translate(&mut self, text: &str) -> Result<String> {
         let key = text.trim();
         if key.is_empty() {
@@ -321,15 +336,18 @@ impl Translator for GeminiTranslator {
             return Ok(cached.clone());
         }
 
-        let translated = match self.call_gemini(key) {
-            Ok(res) => res,
+        let (translated, from_primary) = match self.call_gemini(key) {
+            Ok(res) => (res, true),
             Err(e) => {
                 eprintln!("[Gemini ERROR -> falling back to Google] {e}");
-                self.fallback.translate(key)?
+                self.fallback_notice = Some(format!("{e} | used Google for this line"));
+                (self.fallback.translate(key)?, false)
             }
         };
 
-        if !translated.is_empty() {
+        // Fallback results are shown but never cached or fed into the context history,
+        // so a temporary API error cannot leave a lower-quality line stuck for the session.
+        if from_primary && !translated.is_empty() {
             if self.cache.len() > 500 {
                 self.cache.clear();
             }
@@ -337,7 +355,8 @@ impl Translator for GeminiTranslator {
             if self.history.len() >= 3 {
                 self.history.pop_front();
             }
-            self.history.push_back((key.to_string(), translated.clone()));
+            self.history
+                .push_back((key.to_string(), translated.clone()));
         }
 
         Ok(translated)
@@ -353,6 +372,7 @@ pub struct GroqTranslator {
     cache: HashMap<String, String>,
     history: VecDeque<(String, String)>,
     fallback: GoogleTranslator,
+    fallback_notice: Option<String>,
 }
 
 impl GroqTranslator {
@@ -378,6 +398,7 @@ impl GroqTranslator {
             cache: HashMap::new(),
             history: VecDeque::with_capacity(4),
             fallback,
+            fallback_notice: None,
         })
     }
 
@@ -440,6 +461,10 @@ impl Translator for GroqTranslator {
         "groq"
     }
 
+    fn take_notice(&mut self) -> Option<String> {
+        self.fallback_notice.take()
+    }
+
     fn translate(&mut self, text: &str) -> Result<String> {
         let key = text.trim();
         if key.is_empty() {
@@ -449,15 +474,18 @@ impl Translator for GroqTranslator {
             return Ok(cached.clone());
         }
 
-        let translated = match self.call_groq(key) {
-            Ok(res) => res,
+        let (translated, from_primary) = match self.call_groq(key) {
+            Ok(res) => (res, true),
             Err(e) => {
                 eprintln!("[Groq ERROR -> falling back to Google] {e}");
-                self.fallback.translate(key)?
+                self.fallback_notice = Some(format!("{e} | used Google for this line"));
+                (self.fallback.translate(key)?, false)
             }
         };
 
-        if !translated.is_empty() {
+        // Fallback results are shown but never cached or fed into the context history,
+        // so a temporary API error cannot leave a lower-quality line stuck for the session.
+        if from_primary && !translated.is_empty() {
             if self.cache.len() > 500 {
                 self.cache.clear();
             }
@@ -465,7 +493,8 @@ impl Translator for GroqTranslator {
             if self.history.len() >= 3 {
                 self.history.pop_front();
             }
-            self.history.push_back((key.to_string(), translated.clone()));
+            self.history
+                .push_back((key.to_string(), translated.clone()));
         }
 
         Ok(translated)
@@ -482,6 +511,7 @@ pub struct OpenAiCompatTranslator {
     cache: HashMap<String, String>,
     history: VecDeque<(String, String)>,
     fallback: GoogleTranslator,
+    fallback_notice: Option<String>,
 }
 
 impl OpenAiCompatTranslator {
@@ -521,6 +551,7 @@ impl OpenAiCompatTranslator {
             cache: HashMap::new(),
             history: VecDeque::with_capacity(4),
             fallback,
+            fallback_notice: None,
         })
     }
 
@@ -577,6 +608,10 @@ impl Translator for OpenAiCompatTranslator {
         "openai-compat"
     }
 
+    fn take_notice(&mut self) -> Option<String> {
+        self.fallback_notice.take()
+    }
+
     fn translate(&mut self, text: &str) -> Result<String> {
         let key = text.trim();
         if key.is_empty() {
@@ -586,15 +621,18 @@ impl Translator for OpenAiCompatTranslator {
             return Ok(cached.clone());
         }
 
-        let translated = match self.call_endpoint(key) {
-            Ok(res) => res,
+        let (translated, from_primary) = match self.call_endpoint(key) {
+            Ok(res) => (res, true),
             Err(e) => {
                 eprintln!("[OpenAI-Compat ERROR -> falling back to Google] {e}");
-                self.fallback.translate(key)?
+                self.fallback_notice = Some(format!("{e} | used Google for this line"));
+                (self.fallback.translate(key)?, false)
             }
         };
 
-        if !translated.is_empty() {
+        // Fallback results are shown but never cached or fed into the context history,
+        // so a temporary API error cannot leave a lower-quality line stuck for the session.
+        if from_primary && !translated.is_empty() {
             if self.cache.len() > 500 {
                 self.cache.clear();
             }
@@ -602,7 +640,8 @@ impl Translator for OpenAiCompatTranslator {
             if self.history.len() >= 3 {
                 self.history.pop_front();
             }
-            self.history.push_back((key.to_string(), translated.clone()));
+            self.history
+                .push_back((key.to_string(), translated.clone()));
         }
 
         Ok(translated)
@@ -634,7 +673,10 @@ fn decode_html_entities(s: &str) -> String {
         let after = &rest[pos + 2..];
         if let Some(semi) = after.find(';') {
             let code_str = &after[..semi];
-            let parsed = if let Some(hex) = code_str.strip_prefix('x').or_else(|| code_str.strip_prefix('X')) {
+            let parsed = if let Some(hex) = code_str
+                .strip_prefix('x')
+                .or_else(|| code_str.strip_prefix('X'))
+            {
                 u32::from_str_radix(hex, 16).ok()
             } else {
                 code_str.parse::<u32>().ok()
@@ -673,9 +715,7 @@ pub fn text_similarity(a: &str, b: &str) -> f64 {
         curr[0] = i + 1;
         for (j, &cb) in b_chars.iter().enumerate() {
             let cost = usize::from(ca != cb);
-            curr[j + 1] = (prev[j + 1] + 1)
-                .min(curr[j] + 1)
-                .min(prev[j] + cost);
+            curr[j + 1] = (prev[j + 1] + 1).min(curr[j] + 1).min(prev[j] + cost);
         }
         std::mem::swap(&mut prev, &mut curr);
     }
@@ -710,10 +750,9 @@ pub fn is_same_subtitle(curr: &str, prev: &str) -> bool {
     if min_words >= 3 && max_words <= min_words + 3 {
         let mut matches = 0usize;
         for wc in &w_curr {
-            if w_prev
-                .iter()
-                .any(|wp| wp == wc || (wc.len() >= 4 && wp.len() >= 4 && text_similarity(wc, wp) >= 0.78))
-            {
+            if w_prev.iter().any(|wp| {
+                wp == wc || (wc.len() >= 4 && wp.len() >= 4 && text_similarity(wc, wp) >= 0.78)
+            }) {
                 matches += 1;
             }
         }

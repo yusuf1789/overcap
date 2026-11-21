@@ -2,35 +2,28 @@ use anyhow::Result;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use windows::core::{w, PCWSTR};
-use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
-use windows::Win32::Graphics::Gdi::{
-    BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW, CreateRoundRectRgn,
-    CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, EndPaint, FillRect, GetDC, InvalidateRect,
-    ReleaseDC, SelectObject, SetBkMode, SetTextColor, SetWindowRgn, UpdateWindow,
-    CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DEFAULT_PITCH, DT_CALCRECT, DT_CENTER,
-    DT_NOPREFIX, DT_WORDBREAK, FF_SWISS, FW_BOLD, FW_NORMAL, OUT_DEFAULT_PRECIS, PAINTSTRUCT,
-    SRCCOPY, TRANSPARENT,
-};
+use windows::core::w;
+use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, PAINTSTRUCT};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT,
     VK_A, VK_DOWN, VK_H, VK_Q, VK_S, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyWindow, DispatchMessageW, GetClientRect,
-    GetMessageW, GetSystemMetrics, PostMessageW, PostQuitMessage, RegisterClassW,
-    SetLayeredWindowAttributes, SetWindowDisplayAffinity, SetWindowPos, ShowWindow,
-    TranslateMessage, CS_HREDRAW, CS_VREDRAW, HICON, HWND_TOPMOST, LWA_ALPHA, MSG, SM_CXSCREEN,
-    SM_CYSCREEN, SWP_NOACTIVATE, SWP_SHOWWINDOW, SW_HIDE, WDA_EXCLUDEFROMCAPTURE, WM_APP,
-    WM_DESTROY, WM_ERASEBKGND, WM_HOTKEY, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_PAINT, WM_RBUTTONUP,
-    WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT,
-    WS_POPUP,
+    CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyWindow, DispatchMessageW, GetMessageW,
+    GetSystemMetrics, PostMessageW, PostQuitMessage, RegisterClassW, SetWindowDisplayAffinity,
+    SetWindowPos, ShowWindow, TranslateMessage, CS_HREDRAW, CS_VREDRAW, HICON, HWND_TOPMOST, MSG,
+    SM_CXSCREEN, SM_CYSCREEN, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SW_HIDE,
+    WDA_EXCLUDEFROMCAPTURE, WM_APP, WM_DESTROY, WM_ERASEBKGND, WM_HOTKEY, WM_LBUTTONDBLCLK,
+    WM_LBUTTONUP, WM_PAINT, WM_RBUTTONUP, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
 
-use crate::config::{parse_hex_colorref, AppConfig, Region};
+use crate::config::{AppConfig, OverlayStyle, Region, MAX_OUTLINE_WIDTH};
 use crate::ocr::SourceBounds;
 use crate::profiles::foreground_process_name;
+use crate::render::{measure_text_size, present, render_overlay};
 use crate::selector::select_region;
 use crate::tray::{self, TrayAction, WM_APP_TRAY};
 
@@ -41,6 +34,8 @@ const WM_APP_TOGGLE_PAUSE: u32 = WM_APP + 4;
 const WM_APP_QUIT: u32 = WM_APP + 5;
 
 const MAX_LOG_ENTRIES: usize = 100;
+const MAX_NOTICES: usize = 50;
+const MAX_NOTICE_CHARS: usize = 300;
 
 const HK_QUIT: i32 = 1;
 const HK_TOGGLE: i32 = 2;
@@ -59,37 +54,24 @@ pub struct LogEntry {
     pub dst: String,
 }
 
-#[derive(Debug, Clone)]
-pub struct OverlayStyle {
-    pub font_family: String,
-    pub font_size: i32,
-    pub font_bold: bool,
-    pub text_color: String,
-    pub bg_color: String,
-    pub opacity: u8,
-    pub corner_radius: i32,
-    pub text_shadow: bool,
-    pub fit_to_text: bool,
-    pub padding_x: i32,
-    pub padding_y: i32,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoticeLevel {
+    Warning,
+    Error,
 }
 
-impl OverlayStyle {
-    pub fn from_config(cfg: &AppConfig) -> Self {
-        Self {
-            font_family: cfg.font_family.clone(),
-            font_size: cfg.font_size,
-            font_bold: cfg.font_bold,
-            text_color: cfg.text_color.clone(),
-            bg_color: cfg.bg_color.clone(),
-            opacity: cfg.opacity,
-            corner_radius: cfg.corner_radius,
-            text_shadow: cfg.text_shadow,
-            fit_to_text: cfg.fit_to_text,
-            padding_x: cfg.padding_x,
-            padding_y: cfg.padding_y,
-        }
-    }
+/// A problem worth showing to the user (config reset, engine fallback, save failure, ...).
+/// Release builds have no console, so this is the only place such errors become visible.
+#[derive(Debug, Clone)]
+pub struct Notice {
+    /// Increases with every new (non-merged) notice; lets the GUI track what was dismissed.
+    pub id: u64,
+    pub timestamp: String,
+    pub level: NoticeLevel,
+    pub source: String,
+    pub message: String,
+    /// How many times this identical notice happened in a row.
+    pub count: u32,
 }
 
 pub struct SharedOverlayState {
@@ -98,7 +80,11 @@ pub struct SharedOverlayState {
     pub style: OverlayStyle,
     pub paused: bool,
     pub region: Region,
+    /// Foreground app right now; `None` while Overcap's own window (or nothing usable) is focused.
     pub active_app: Option<String>,
+    /// Most recent foreground app other than Overcap, so the GUI can offer per-app styles
+    /// even though Overcap itself is focused while the user edits.
+    pub last_app: Option<String>,
     pub config: AppConfig,
 }
 
@@ -112,6 +98,8 @@ pub struct OverlayHandle {
     pub engine_reload_requested: Arc<AtomicBool>,
     pub last_latency_ms: Arc<AtomicU64>,
     pub logs: Arc<Mutex<VecDeque<LogEntry>>>,
+    notices: Arc<Mutex<VecDeque<Notice>>>,
+    next_notice_id: Arc<AtomicU64>,
 }
 
 impl OverlayHandle {
@@ -146,25 +134,83 @@ impl OverlayHandle {
         }
     }
 
+    /// Applies `style` live and, if `save_to_config`, stores it as the global style.
     pub fn apply_style(&self, style: OverlayStyle, save_to_config: bool) {
         if let Ok(mut st) = self.state.lock() {
-            st.style = style.clone();
             if save_to_config {
-                st.config.font_family = style.font_family;
-                st.config.font_size = style.font_size;
-                st.config.font_bold = style.font_bold;
-                st.config.text_color = style.text_color;
-                st.config.bg_color = style.bg_color;
-                st.config.opacity = style.opacity;
-                st.config.corner_radius = style.corner_radius;
-                st.config.text_shadow = style.text_shadow;
-                st.config.fit_to_text = style.fit_to_text;
-                st.config.padding_x = style.padding_x;
-                st.config.padding_y = style.padding_y;
-                let _ = st.config.save();
+                style.write_to_config(&mut st.config);
+                self.save_config_or_notice(&st.config);
+            }
+            st.style = style;
+        }
+        self.post_msg(WM_APP_STYLE);
+    }
+
+    /// Applies `style` live and stores it as the style for `app` (lowercase `.exe` name).
+    pub fn apply_app_style(&self, app: &str, style: OverlayStyle) {
+        if let Ok(mut st) = self.state.lock() {
+            st.config
+                .profile_styles
+                .insert(app.to_string(), style.clone());
+            self.save_config_or_notice(&st.config);
+            st.style = style;
+        }
+        self.post_msg(WM_APP_STYLE);
+    }
+
+    /// Removes the per-app style; the overlay falls back to the global style.
+    pub fn remove_app_style(&self, app: &str) {
+        if let Ok(mut st) = self.state.lock() {
+            if st.config.profile_styles.remove(app).is_some() {
+                self.save_config_or_notice(&st.config);
+                st.style = OverlayStyle::from_config(&st.config);
             }
         }
         self.post_msg(WM_APP_STYLE);
+    }
+
+    /// Switches the live style to the one that belongs to `app` (its own style, or the global
+    /// one). Does not touch the config.
+    pub fn activate_style_for_app(&self, app: &str) {
+        let changed = if let Ok(mut st) = self.state.lock() {
+            let style = st.config.style_for_app(Some(app));
+            if style != st.style {
+                st.style = style;
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if changed {
+            self.post_msg(WM_APP_STYLE);
+        }
+    }
+
+    /// Changes the font size of the style currently in effect (the active app's own style if
+    /// it has one, otherwise the global style), saves it, and returns the new size.
+    fn adjust_font_size(&self, delta: i32) -> Option<i32> {
+        let mut st = self.state.lock().ok()?;
+        let new_size = (st.style.font_size + delta).clamp(14, 64);
+        let app_key = st
+            .active_app
+            .clone()
+            .filter(|a| st.config.auto_profiles && st.config.profile_styles.contains_key(a));
+
+        match app_key {
+            Some(app) => {
+                if let Some(s) = st.config.profile_styles.get_mut(&app) {
+                    s.font_size = new_size;
+                }
+            }
+            None => st.config.font_size = new_size,
+        }
+        st.style.font_size = new_size;
+        self.save_config_or_notice(&st.config);
+        drop(st);
+        self.post_msg(WM_APP_STYLE);
+        Some(new_size)
     }
 
     pub fn current_region(&self) -> Region {
@@ -200,8 +246,29 @@ impl OverlayHandle {
 
     pub fn set_active_app(&self, app: Option<String>) {
         if let Ok(mut st) = self.state.lock() {
+            // Windows shell processes take focus all the time (taskbar, Start, search) and are
+            // never a subtitle source, so keep them out of the per-app style list.
+            const SHELL_PROCESSES: &[&str] = &[
+                "explorer.exe",
+                "shellexperiencehost.exe",
+                "startmenuexperiencehost.exe",
+                "searchhost.exe",
+                "searchapp.exe",
+                "textinputhost.exe",
+                "applicationframehost.exe",
+                "lockapp.exe",
+            ];
+            if let Some(name) = app.as_deref() {
+                if !SHELL_PROCESSES.contains(&name) {
+                    st.last_app = Some(name.to_string());
+                }
+            }
             st.active_app = app;
         }
+    }
+
+    pub fn last_app(&self) -> Option<String> {
+        self.state.lock().ok().and_then(|s| s.last_app.clone())
     }
 
     pub fn active_app(&self) -> Option<String> {
@@ -250,6 +317,63 @@ impl OverlayHandle {
         }
     }
 
+    /// Records a user-visible problem. Identical consecutive notices are merged into one
+    /// entry with a growing `count`, so a failing API cannot flood the list.
+    pub fn push_notice(&self, level: NoticeLevel, source: &str, message: impl Into<String>) {
+        let mut message: String = message.into().replace(['\r', '\n'], " ");
+        if message.chars().count() > MAX_NOTICE_CHARS {
+            message = message.chars().take(MAX_NOTICE_CHARS).collect::<String>() + "...";
+        }
+        let timestamp = crate::current_hms();
+
+        let Ok(mut notices) = self.notices.lock() else {
+            return;
+        };
+        if let Some(last) = notices.back_mut() {
+            if last.level == level && last.source == source && last.message == message {
+                last.count = last.count.saturating_add(1);
+                last.timestamp = timestamp;
+                return;
+            }
+        }
+        while notices.len() >= MAX_NOTICES {
+            notices.pop_front();
+        }
+        let id = self.next_notice_id.fetch_add(1, Ordering::SeqCst) + 1;
+        notices.push_back(Notice {
+            id,
+            timestamp,
+            level,
+            source: source.to_string(),
+            message,
+            count: 1,
+        });
+    }
+
+    pub fn recent_notices(&self) -> Vec<Notice> {
+        self.notices
+            .lock()
+            .map(|n| n.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    pub fn clear_notices(&self) {
+        if let Ok(mut notices) = self.notices.lock() {
+            notices.clear();
+        }
+    }
+
+    /// Saves `cfg` and reports a failure as a notice instead of dropping it.
+    pub fn save_config_or_notice(&self, cfg: &AppConfig) {
+        if let Err(e) = cfg.save() {
+            self.push_notice(
+                NoticeLevel::Error,
+                "config",
+                format!("Could not save config.json: {e}"),
+            );
+        }
+    }
+
     pub fn request_open_gui(&self) {
         self.gui_open_requested.store(true, Ordering::SeqCst);
     }
@@ -275,6 +399,7 @@ impl OverlayHandle {
     pub fn delete_profile(&self, app: &str) -> Result<()> {
         if let Ok(mut st) = self.state.lock() {
             st.config.profiles.remove(app);
+            st.config.profile_styles.remove(app);
             if st.active_app.as_deref() == Some(app) {
                 st.active_app = None;
             }
@@ -295,69 +420,6 @@ impl OverlayHandle {
 
 static OVERLAY_HANDLE: Mutex<Option<OverlayHandle>> = Mutex::new(None);
 static TRAY_ICON: Mutex<isize> = Mutex::new(0);
-
-fn measure_text_size(text: &str, style: &OverlayStyle, max_width: i32) -> (i32, i32) {
-    unsafe {
-        let hdc = GetDC(None);
-        if hdc.is_invalid() {
-            return (max_width, style.font_size + 12);
-        }
-        let mut face_w: Vec<u16> = style.font_family.encode_utf16().collect();
-        face_w.push(0);
-        let weight = if style.font_bold { FW_BOLD.0 } else { FW_NORMAL.0 } as i32;
-
-        let font = CreateFontW(
-            -style.font_size,
-            0,
-            0,
-            0,
-            weight,
-            0,
-            0,
-            0,
-            DEFAULT_CHARSET.0 as u32,
-            OUT_DEFAULT_PRECIS.0 as u32,
-            CLIP_DEFAULT_PRECIS.0 as u32,
-            CLEARTYPE_QUALITY.0 as u32,
-            (DEFAULT_PITCH.0 | FF_SWISS.0) as u32,
-            PCWSTR(face_w.as_ptr()),
-        );
-        let old_font = SelectObject(hdc, font);
-
-        let mut wide: Vec<u16> = text.encode_utf16().collect();
-        let mut rc = RECT {
-            left: 0,
-            top: 0,
-            right: max_width.max(40),
-            bottom: 0,
-        };
-        DrawTextW(
-            hdc,
-            &mut wide,
-            &mut rc,
-            DT_CENTER | DT_WORDBREAK | DT_NOPREFIX | DT_CALCRECT,
-        );
-
-        SelectObject(hdc, old_font);
-        let _ = DeleteObject(font);
-        ReleaseDC(None, hdc);
-
-        ((rc.right - rc.left).max(20), (rc.bottom - rc.top).max(20))
-    }
-}
-
-fn apply_window_shape_and_alpha(hwnd: HWND, w: i32, h: i32, opacity: u8, radius: i32) {
-    unsafe {
-        let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), opacity, LWA_ALPHA);
-        if radius > 0 {
-            let r = radius.clamp(0, 48);
-            let hrgn = CreateRoundRectRgn(0, 0, w + 1, h + 1, r * 2, r * 2);
-            let _ = SetWindowRgn(hwnd, hrgn, true);
-        } else {
-            let _ = SetWindowRgn(hwnd, None, true);
-        }
-    }
-}
 
 fn apply_visibility_and_redraw(hwnd: HWND) {
     let snapshot = OVERLAY_HANDLE.lock().ok().and_then(|g| {
@@ -399,9 +461,11 @@ fn apply_visibility_and_redraw(hwnd: HWND) {
 
             let pad_x = style.padding_x.clamp(4, 60);
             let pad_y = style.padding_y.clamp(2, 40);
+            // The outline extends past the glyphs on every side, so the box needs room for it.
+            let outline = style.outline_width.clamp(0, MAX_OUTLINE_WIDTH);
 
             let (box_x, box_y, box_w, box_h) = if style.fit_to_text {
-                let max_text_w = (region.width - pad_x * 2).max(60);
+                let max_text_w = (region.width - pad_x * 2 - outline * 2).max(60);
                 let (tw, th) = measure_text_size(text.trim(), &style, max_text_w);
 
                 // Ensure the overlay box is at least large enough to fully cover the
@@ -421,8 +485,14 @@ fn apply_visibility_and_redraw(hwnd: HWND) {
                     ),
                 };
 
-                let bw = (tw + pad_x * 2 + 10).max(min_cover_w).min(region.width).max(60);
-                let bh = (th + pad_y * 2 + 4).max(min_cover_h).min(region.height).max(32);
+                let bw = (tw + pad_x * 2 + 10 + outline * 2)
+                    .max(min_cover_w)
+                    .min(region.width)
+                    .max(60);
+                let bh = (th + pad_y * 2 + 4 + outline * 2)
+                    .max(min_cover_h)
+                    .min(region.height)
+                    .max(32);
 
                 let max_x = (region.left + region.width - bw).max(region.left);
                 let max_y = (region.top + region.height - bh).max(region.top);
@@ -433,18 +503,31 @@ fn apply_visibility_and_redraw(hwnd: HWND) {
                 (region.left, region.top, region.width, region.height)
             };
 
+            // Per-pixel-alpha frame: background opacity applies to the box only, text stays opaque.
+            let frame = render_overlay(text.trim(), &style, box_w, box_h);
+            if let Err(e) = present(hwnd, box_x, box_y, box_w, box_h, &frame) {
+                if let Ok(guard) = OVERLAY_HANDLE.lock() {
+                    if let Some(h) = guard.as_ref() {
+                        h.push_notice(
+                            NoticeLevel::Error,
+                            "overlay",
+                            format!("Could not draw the subtitle overlay: {e}"),
+                        );
+                    }
+                }
+                return;
+            }
+            // Position and size were already set by UpdateLayeredWindow; this only shows the
+            // window topmost without activating it.
             let _ = SetWindowPos(
                 hwnd,
                 HWND_TOPMOST,
-                box_x,
-                box_y,
-                box_w,
-                box_h,
-                SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOMOVE | SWP_NOSIZE,
             );
-            apply_window_shape_and_alpha(hwnd, box_w, box_h, style.opacity, style.corner_radius);
-            let _ = InvalidateRect(hwnd, None, false);
-            let _ = UpdateWindow(hwnd);
         } else {
             let _ = ShowWindow(hwnd, SW_HIDE);
         }
@@ -498,7 +581,7 @@ fn handle_reselect(hwnd: HWND) {
                         st.config.profiles.insert(app.clone(), new_region);
                         println!("[Profile] Saved region for {}", app);
                     }
-                    let _ = st.config.save();
+                    h.save_config_or_notice(&st.config);
                 }
                 h.region_changed.store(true, Ordering::SeqCst);
             }
@@ -599,16 +682,11 @@ unsafe extern "system" fn overlay_wnd_proc(
                     let delta = if id == HK_FONT_UP { 2 } else { -2 };
                     if let Ok(guard) = OVERLAY_HANDLE.lock() {
                         if let Some(h) = guard.as_ref() {
-                            if let Ok(mut st) = h.state.lock() {
-                                st.style.font_size = (st.style.font_size + delta).clamp(14, 64);
-                                st.config.font_size = st.style.font_size;
-                                let _ = st.config.save();
-                                println!("[Hotkey] Font size: {}", st.style.font_size);
+                            if let Some(size) = h.adjust_font_size(delta) {
+                                println!("[Hotkey] Font size: {size}");
                             }
                         }
                     }
-                    let _ = InvalidateRect(hwnd, None, false);
-                    let _ = UpdateWindow(hwnd);
                 }
                 HK_SETTINGS => {
                     println!("[Hotkey] Ctrl+Shift+A -> Opening Overcap window...");
@@ -619,118 +697,10 @@ unsafe extern "system" fn overlay_wnd_proc(
             LRESULT(0)
         }
         WM_PAINT => {
+            // Content is pushed with UpdateLayeredWindow (see `render::present`); this only
+            // validates the update region.
             let mut ps = PAINTSTRUCT::default();
-            let hdc = BeginPaint(hwnd, &mut ps);
-
-            let mut client = RECT::default();
-            let _ = GetClientRect(hwnd, &mut client);
-            let w = client.right - client.left;
-            let h = client.bottom - client.top;
-
-            let (text, style) = OVERLAY_HANDLE
-                .lock()
-                .ok()
-                .and_then(|g| {
-                    let handle = g.as_ref()?;
-                    let st = handle.state.lock().ok()?;
-                    Some((st.text.clone(), st.style.clone()))
-                })
-                .unwrap_or_else(|| (String::new(), OverlayStyle::from_config(&AppConfig::default())));
-
-            if w > 0 && h > 0 {
-                let mem_dc = CreateCompatibleDC(hdc);
-                let mem_bmp = CreateCompatibleBitmap(hdc, w, h);
-                let old_bmp = SelectObject(mem_dc, mem_bmp);
-
-                let bg_cr = parse_hex_colorref(&style.bg_color, 0x000C0A0A);
-                let bg = CreateSolidBrush(COLORREF(bg_cr));
-                FillRect(mem_dc, &client, bg);
-                let _ = DeleteObject(bg);
-
-                if !text.trim().is_empty() {
-                    let mut face_w: Vec<u16> = style.font_family.encode_utf16().collect();
-                    face_w.push(0);
-                    let weight = if style.font_bold { FW_BOLD.0 } else { FW_NORMAL.0 } as i32;
-
-                    let font = CreateFontW(
-                        -style.font_size,
-                        0,
-                        0,
-                        0,
-                        weight,
-                        0,
-                        0,
-                        0,
-                        DEFAULT_CHARSET.0 as u32,
-                        OUT_DEFAULT_PRECIS.0 as u32,
-                        CLIP_DEFAULT_PRECIS.0 as u32,
-                        CLEARTYPE_QUALITY.0 as u32,
-                        (DEFAULT_PITCH.0 | FF_SWISS.0) as u32,
-                        PCWSTR(face_w.as_ptr()),
-                    );
-                    let old_font = SelectObject(mem_dc, font);
-                    SetBkMode(mem_dc, TRANSPARENT);
-
-                    let pad_x = style.padding_x.clamp(4, 60);
-                    let pad_y = style.padding_y.clamp(2, 40);
-                    let mut wide: Vec<u16> = text.encode_utf16().collect();
-
-                    let mut calc_rect = RECT {
-                        left: pad_x,
-                        top: 0,
-                        right: (w - pad_x).max(pad_x + 10),
-                        bottom: 0,
-                    };
-                    let text_h = DrawTextW(
-                        mem_dc,
-                        &mut wide,
-                        &mut calc_rect,
-                        DT_CENTER | DT_WORDBREAK | DT_NOPREFIX | DT_CALCRECT,
-                    );
-
-                    let top_y = ((h - text_h) / 2).max(pad_y);
-
-                    if style.text_shadow {
-                        SetTextColor(mem_dc, COLORREF(0x00000000));
-                        let mut shadow_rect = RECT {
-                            left: pad_x + 2,
-                            top: top_y + 2,
-                            right: (w - pad_x + 2).max(pad_x + 12),
-                            bottom: h - pad_y + 2,
-                        };
-                        DrawTextW(
-                            mem_dc,
-                            &mut wide,
-                            &mut shadow_rect,
-                            DT_CENTER | DT_WORDBREAK | DT_NOPREFIX,
-                        );
-                    }
-
-                    let fg_cr = parse_hex_colorref(&style.text_color, 0x00FFFFFF);
-                    SetTextColor(mem_dc, COLORREF(fg_cr));
-                    let mut draw_rect = RECT {
-                        left: pad_x,
-                        top: top_y,
-                        right: (w - pad_x).max(pad_x + 10),
-                        bottom: h - pad_y,
-                    };
-                    DrawTextW(
-                        mem_dc,
-                        &mut wide,
-                        &mut draw_rect,
-                        DT_CENTER | DT_WORDBREAK | DT_NOPREFIX,
-                    );
-
-                    SelectObject(mem_dc, old_font);
-                    let _ = DeleteObject(font);
-                }
-
-                let _ = BitBlt(hdc, 0, 0, w, h, mem_dc, 0, 0, SRCCOPY);
-                SelectObject(mem_dc, old_bmp);
-                let _ = DeleteObject(mem_bmp);
-                let _ = DeleteDC(mem_dc);
-            }
-
+            BeginPaint(hwnd, &mut ps);
             let _ = EndPaint(hwnd, &ps);
             LRESULT(0)
         }
@@ -766,6 +736,7 @@ pub fn create_handle(config: AppConfig, region: Region) -> OverlayHandle {
             paused: false,
             region,
             active_app: None,
+            last_app: None,
             config,
         })),
         region_changed: Arc::new(AtomicBool::new(false)),
@@ -774,6 +745,8 @@ pub fn create_handle(config: AppConfig, region: Region) -> OverlayHandle {
         engine_reload_requested: Arc::new(AtomicBool::new(false)),
         last_latency_ms: Arc::new(AtomicU64::new(0)),
         logs: Arc::new(Mutex::new(VecDeque::with_capacity(MAX_LOG_ENTRIES))),
+        notices: Arc::new(Mutex::new(VecDeque::with_capacity(MAX_NOTICES))),
+        next_notice_id: Arc::new(AtomicU64::new(0)),
     }
 }
 
@@ -801,11 +774,8 @@ pub fn run_overlay_loop(handle: OverlayHandle) -> Result<()> {
         };
         let _ = RegisterClassW(&wc);
 
-        let ex_style = WS_EX_TOPMOST
-            | WS_EX_LAYERED
-            | WS_EX_TRANSPARENT
-            | WS_EX_NOACTIVATE
-            | WS_EX_TOOLWINDOW;
+        let ex_style =
+            WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW;
 
         let hwnd = CreateWindowExW(
             ex_style,
@@ -829,11 +799,8 @@ pub fn run_overlay_loop(handle: OverlayHandle) -> Result<()> {
         // CRITICAL: Exclude this overlay window from screen capture so OCR always sees
         // the underlying original subtitle underneath our translated overlay.
         SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE)?;
-        let (opacity, radius) = {
-            let st = handle.state.lock().unwrap();
-            (st.style.opacity, st.style.corner_radius)
-        };
-        apply_window_shape_and_alpha(hwnd, region.width, region.height, opacity, radius);
+        // Do NOT call SetLayeredWindowAttributes on this window: once it has been used,
+        // UpdateLayeredWindow (per-pixel alpha, see render.rs) fails for the window's lifetime.
 
         let mods = HOT_KEY_MODIFIERS(MOD_CONTROL.0 | MOD_SHIFT.0 | MOD_NOREPEAT.0);
         let _ = RegisterHotKey(hwnd, HK_QUIT, mods, VK_Q.0 as u32);

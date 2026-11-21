@@ -6,6 +6,7 @@ mod gui;
 mod ocr;
 mod overlay;
 mod profiles;
+mod render;
 mod selector;
 mod translator;
 mod tray;
@@ -24,7 +25,7 @@ use windows::Win32::UI::HiDpi::{
 use crate::capture::{capture_region, changed_pixel_ratio, upscale_for_ocr};
 use crate::config::AppConfig;
 use crate::ocr::{SourceBounds, WinOcr};
-use crate::overlay::{create_handle, run_overlay_loop, LogEntry, OverlayHandle};
+use crate::overlay::{create_handle, run_overlay_loop, LogEntry, NoticeLevel, OverlayHandle};
 use crate::selector::select_region;
 use crate::translator::{
     is_same_subtitle, GeminiTranslator, GoogleTranslator, GroqTranslator, OpenAiCompatTranslator,
@@ -168,55 +169,66 @@ fn current_hms() -> String {
     format!("{h:02}:{m:02}:{s:02}")
 }
 
-fn build_translator(cfg: &AppConfig) -> Result<Box<dyn Translator>> {
+/// Builds the configured engine. If it cannot be created (missing key, client error) the
+/// Google translator is returned instead, together with a warning describing why.
+fn build_translator(cfg: &AppConfig) -> Result<(Box<dyn Translator>, Option<String>)> {
     let engine_name = cfg.engine.as_str();
     let source_lang = cfg.source_lang.as_str();
     let target_lang = cfg.target_lang.as_str();
+    let mut warning: Option<String> = None;
 
     if engine_name.eq_ignore_ascii_case("groq") {
         let key = cfg
             .groq_api_key
             .clone()
             .filter(|k| !k.trim().is_empty())
-            .or_else(|| std::env::var("GROQ_API_KEY").ok().filter(|k| !k.trim().is_empty()));
+            .or_else(|| {
+                std::env::var("GROQ_API_KEY")
+                    .ok()
+                    .filter(|k| !k.trim().is_empty())
+            });
 
         if let Some(api_key) = key {
             match GroqTranslator::new(api_key, cfg.groq_model.clone(), source_lang, target_lang) {
                 Ok(t) => {
                     println!("[Ready] Groq model: {}", cfg.groq_model);
-                    return Ok(Box::new(t));
+                    return Ok((Box::new(t), None));
                 }
                 Err(e) => {
                     eprintln!("[Groq ERROR] {e} -> falling back to Google");
+                    warning = Some(format!("Groq could not start ({e}); using Google."));
                 }
             }
         } else {
             println!("[Warning] GROQ_API_KEY not found (--groq-key or config.json), falling back to Google.");
+            warning = Some("Groq is selected but no API key is set; using Google.".to_string());
         }
     } else if engine_name.eq_ignore_ascii_case("gemini") {
         let key = cfg
             .gemini_api_key
             .clone()
             .filter(|k| !k.trim().is_empty())
-            .or_else(|| std::env::var("GEMINI_API_KEY").ok().filter(|k| !k.trim().is_empty()));
+            .or_else(|| {
+                std::env::var("GEMINI_API_KEY")
+                    .ok()
+                    .filter(|k| !k.trim().is_empty())
+            });
 
         if let Some(api_key) = key {
-            match GeminiTranslator::new(
-                api_key,
-                cfg.gemini_model.clone(),
-                source_lang,
-                target_lang,
-            ) {
+            match GeminiTranslator::new(api_key, cfg.gemini_model.clone(), source_lang, target_lang)
+            {
                 Ok(t) => {
                     println!("[Ready] Gemini model: {}", cfg.gemini_model);
-                    return Ok(Box::new(t));
+                    return Ok((Box::new(t), None));
                 }
                 Err(e) => {
                     eprintln!("[Gemini ERROR] {e} -> falling back to Google");
+                    warning = Some(format!("Gemini could not start ({e}); using Google."));
                 }
             }
         } else {
             println!("[Warning] GEMINI_API_KEY not found (--gemini-key or config.json), falling back to Google.");
+            warning = Some("Gemini is selected but no API key is set; using Google.".to_string());
         }
     } else if engine_name.eq_ignore_ascii_case("openai-compat")
         || engine_name.eq_ignore_ascii_case("custom")
@@ -226,7 +238,11 @@ fn build_translator(cfg: &AppConfig) -> Result<Box<dyn Translator>> {
             .custom_api_key
             .clone()
             .filter(|k| !k.trim().is_empty())
-            .or_else(|| std::env::var("OPENAI_API_KEY").ok().filter(|k| !k.trim().is_empty()));
+            .or_else(|| {
+                std::env::var("OPENAI_API_KEY")
+                    .ok()
+                    .filter(|k| !k.trim().is_empty())
+            });
 
         match OpenAiCompatTranslator::new(
             cfg.custom_base_url.clone(),
@@ -240,15 +256,21 @@ fn build_translator(cfg: &AppConfig) -> Result<Box<dyn Translator>> {
                     "[Ready] OpenAI-compat endpoint: {} (model: {})",
                     cfg.custom_base_url, cfg.custom_model
                 );
-                return Ok(Box::new(t));
+                return Ok((Box::new(t), None));
             }
             Err(e) => {
                 eprintln!("[OpenAI-compat ERROR] {e} -> falling back to Google");
+                warning = Some(format!(
+                    "OpenAI-compatible endpoint could not start ({e}); using Google."
+                ));
             }
         }
     }
 
-    Ok(Box::new(GoogleTranslator::new(source_lang, target_lang)?))
+    Ok((
+        Box::new(GoogleTranslator::new(source_lang, target_lang)?),
+        warning,
+    ))
 }
 
 fn translation_worker(
@@ -262,9 +284,19 @@ fn translation_worker(
     let mut target_lang = init_cfg.target_lang.clone();
 
     let mut translator = match build_translator(&init_cfg) {
-        Ok(t) => t,
+        Ok((t, warning)) => {
+            if let Some(w) = warning {
+                handle.push_notice(NoticeLevel::Warning, "engine", w);
+            }
+            t
+        }
         Err(e) => {
             eprintln!("[Translation ERROR] {e}");
+            handle.push_notice(
+                NoticeLevel::Error,
+                "engine",
+                format!("Translation engine failed to start: {e}"),
+            );
             handle.stop_flag.store(true, Ordering::SeqCst);
             return;
         }
@@ -283,7 +315,10 @@ fn translation_worker(
             source_lang = cfg.source_lang.clone();
             target_lang = cfg.target_lang.clone();
             match build_translator(&cfg) {
-                Ok(t) => {
+                Ok((t, warning)) => {
+                    if let Some(w) = warning {
+                        handle.push_notice(NoticeLevel::Warning, "engine", w);
+                    }
                     translator = t;
                     println!(
                         "[Reloaded] Translation engine: {} ({} -> {})",
@@ -294,11 +329,17 @@ fn translation_worker(
                 }
                 Err(e) => {
                     eprintln!("[Reload ERROR] {e}");
+                    handle.push_notice(
+                        NoticeLevel::Error,
+                        "engine",
+                        format!("Engine reload failed, keeping the previous engine: {e}"),
+                    );
                 }
             }
         }
 
-        let Some(job) = slot.take_blocking(&handle.stop_flag, &handle.engine_reload_requested) else {
+        let Some(job) = slot.take_blocking(&handle.stop_flag, &handle.engine_reload_requested)
+        else {
             continue;
         };
 
@@ -307,7 +348,12 @@ fn translation_worker(
             continue;
         }
 
-        match translator.translate(&job.text) {
+        let result = translator.translate(&job.text);
+        if let Some(note) = translator.take_notice() {
+            handle.push_notice(NoticeLevel::Warning, translator.name(), note);
+        }
+
+        match result {
             Ok(translated) if !translated.is_empty() => {
                 // Show translation unless subtitles were explicitly cleared/reset after this capture
                 if job.seq > cleared_seq.load(Ordering::SeqCst) {
@@ -335,6 +381,11 @@ fn translation_worker(
             Ok(_) => {}
             Err(e) => {
                 eprintln!("[Translation ERROR] {e}");
+                handle.push_notice(
+                    NoticeLevel::Error,
+                    translator.name(),
+                    format!("Translation failed: {e}"),
+                );
             }
         }
     }
@@ -372,6 +423,11 @@ fn ocr_worker(
         }
         Err(e) => {
             eprintln!("[OCR ERROR] {e}");
+            handle.push_notice(
+                NoticeLevel::Error,
+                "ocr",
+                format!("OCR engine failed to start: {e}"),
+            );
             handle.stop_flag.store(true, Ordering::SeqCst);
             return;
         }
@@ -393,11 +449,23 @@ fn ocr_worker(
                 .source_lang
                 .eq_ignore_ascii_case(&active_source_lang)
             {
-                if let Ok(new_ocr) = WinOcr::new(&cfg_snap.source_lang) {
-                    active_source_lang = cfg_snap.source_lang.clone();
-                    ocr = new_ocr;
-                    prev_bgra = None;
-                    last_src.clear();
+                match WinOcr::new(&cfg_snap.source_lang) {
+                    Ok(new_ocr) => {
+                        active_source_lang = cfg_snap.source_lang.clone();
+                        ocr = new_ocr;
+                        prev_bgra = None;
+                        last_src.clear();
+                    }
+                    Err(e) => {
+                        handle.push_notice(
+                            NoticeLevel::Error,
+                            "ocr",
+                            format!(
+                                "Cannot switch OCR to '{}': {e}. Still reading '{}'.",
+                                cfg_snap.source_lang, active_source_lang
+                            ),
+                        );
+                    }
                 }
             }
 
@@ -406,6 +474,9 @@ fn ocr_worker(
                 last_fg_app = fg_app.clone();
                 handle.set_active_app(fg_app.clone());
                 if let Some(ref app) = fg_app {
+                    // Per-app subtitle look (falls back to the global style when the app has
+                    // none or per-app switching is off).
+                    handle.activate_style_for_app(app);
                     if cfg_snap.auto_profiles {
                         if let Some(&prof_region) = cfg_snap.profiles.get(app) {
                             if handle.current_region() != prof_region {
@@ -446,6 +517,11 @@ fn ocr_worker(
             Ok(f) => f,
             Err(e) => {
                 eprintln!("[Capture ERROR] {e}");
+                handle.push_notice(
+                    NoticeLevel::Error,
+                    "capture",
+                    format!("Screen capture failed: {e}"),
+                );
                 thread::sleep(Duration::from_millis(300));
                 continue;
             }
@@ -467,6 +543,7 @@ fn ocr_worker(
             Ok(out) => out,
             Err(e) => {
                 eprintln!("[OCR ERROR] {e}");
+                handle.push_notice(NoticeLevel::Error, "ocr", format!("OCR failed: {e}"));
                 thread::sleep(sleep_dur);
                 continue;
             }
@@ -515,7 +592,13 @@ fn main() -> Result<()> {
     }
 
     let args = Args::parse();
-    let mut cfg = AppConfig::load();
+    let (mut cfg, config_notice) = AppConfig::load_with_notice();
+
+    // The overlay handle does not exist yet, so notices are queued and pushed once it does.
+    let mut startup_notices: Vec<(NoticeLevel, &str, String)> = Vec::new();
+    if let Some(msg) = config_notice {
+        startup_notices.push((NoticeLevel::Warning, "config", msg));
+    }
 
     let mut cfg_dirty = false;
     if let Some(engine) = args.engine {
@@ -571,7 +654,13 @@ fn main() -> Result<()> {
         cfg_dirty = true;
     }
     if cfg_dirty && cfg.region.is_some() {
-        let _ = cfg.save();
+        if let Err(e) = cfg.save() {
+            startup_notices.push((
+                NoticeLevel::Error,
+                "config",
+                format!("Could not save config.json: {e}"),
+            ));
+        }
     }
 
     let region = if args.select {
@@ -599,6 +688,9 @@ fn main() -> Result<()> {
 
     let source_lang = cfg.source_lang.clone();
     let handle = create_handle(cfg, region);
+    for (level, source, msg) in startup_notices {
+        handle.push_notice(level, source, msg);
+    }
     let slot = Arc::new(TranslationSlot::new());
     let latest_seq = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let cleared_seq = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -629,10 +721,26 @@ fn main() -> Result<()> {
 
     let overlay_handle = handle.clone();
     thread::spawn(move || {
+        let mut exit_code = 0;
         if let Err(e) = run_overlay_loop(overlay_handle.clone()) {
             eprintln!("[Overlay ERROR] {e}");
+            overlay_handle.push_notice(
+                NoticeLevel::Error,
+                "overlay",
+                format!("Overlay window failed: {e}"),
+            );
             overlay_handle.stop_flag.store(true, Ordering::SeqCst);
+            exit_code = 1;
         }
+
+        // The overlay loop only ends on Quit (or a fatal error). The GUI normally notices
+        // `stop_flag` in `update()` and closes itself, but a window hidden in the tray may
+        // never be repainted, which would leave an invisible process running. Give it a
+        // moment to shut down cleanly, then force the exit. Settings are saved on every
+        // change, so nothing is lost.
+        overlay_handle.stop_flag.store(true, Ordering::SeqCst);
+        thread::sleep(Duration::from_millis(1000));
+        std::process::exit(exit_code);
     });
 
     gui::run_gui(handle, args.minimized)?;

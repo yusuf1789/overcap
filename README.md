@@ -136,7 +136,8 @@ See [config.example.json](config.example.json) for a configuration template. `co
 - `src/capture.rs` — GDI `BitBlt` region capture, bright-pixel change mask, and 2x bilinear upscale.
 - `src/ocr.rs` — `Windows.Media.Ocr` wrapper, line ordering, and `SourceBounds` calculation.
 - `src/translator.rs` — `Translator` trait (`GroqTranslator`, `GeminiTranslator`, `GoogleTranslator`), cache, and smart duplicate filter.
-- `src/overlay.rs` — `WDA_EXCLUDEFROMCAPTURE` + click-through Win32 overlay, dynamic Auto-Fit, rounded corners, tray dispatch, and global hotkeys.
+- `src/render.rs` — Per-pixel-alpha overlay compositing: translucent background box, text outline and shadow, always-opaque text.
+- `src/overlay.rs` — `WDA_EXCLUDEFROMCAPTURE` + click-through Win32 overlay, dynamic Auto-Fit, per-app styles, tray dispatch, and global hotkeys.
 - `src/selector.rs` — High-DPI, multi-monitor Win32 region selector.
 - `src/gui.rs` — Native `eframe`/`egui` desktop control center and live preview UI.
 - `src/tray.rs` — Native Win32 System Tray icon and context menu.

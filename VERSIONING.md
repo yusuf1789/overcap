@@ -8,11 +8,31 @@ Overcap follows [Semantic Versioning 2.0.0](https://semver.org/) (`MAJOR.MINOR.P
 - **MINOR (`0.X.0`)**: Backward-compatible new features (new translation backend, new overlay capability, new settings UI controls).
 - **PATCH (`0.0.X`)**: Bug fixes, OCR/capture performance improvements, and documentation updates.
 
+**Current practice:** the project stays on `0.4.x` for now. New features and fixes bump `PATCH` (`0.4.1`, `0.4.2`, ...) until the maintainer decides to move to `0.5.0`.
+
 The canonical version number is maintained in `package.version` inside [Cargo.toml](Cargo.toml).
 
 ---
 
 ## Changelog
+
+### `v0.4.1` — Subtitle Look: Background-Only Opacity, Outline & Per-App Styles
+- **Behavior change:** `opacity` now applies to the background box only. The overlay is drawn with per-pixel alpha (`UpdateLayeredWindow`) instead of one window-wide alpha, so text is always fully opaque. Existing `opacity` values keep working but the text is now sharper than before at the same setting; the slider range is `0..=255` (was `40..=255`). Text is rendered with grayscale instead of ClearType antialiasing, which is required for transparency. Rounded corners are anti-aliased in the bitmap instead of a window region.
+- Added a text outline (`outline_width` 0-6 px, `outline_color`); default width `0` keeps existing looks. The drop shadow now follows the outline shape. `Yellow` and `High Contrast` presets use a thin outline.
+- Added per-app subtitle styles (`profile_styles` in `config.json`): the Appearance tab can edit the global style or the style of the last focused app (`Remove App Style` reverts it). The overlay switches styles with the foreground app when `Auto-Switch by App` is on, and the font-size hotkeys change the style in effect. The Profiles tab lists apps with a region and/or a custom style.
+- New `src/render.rs` module with unit tests; `OverlayStyle` moved to `config.rs`. New config fields are backward compatible (`#[serde(default)]`).
+
+### `v0.4.0` — In-App Notices (Banner & Events)
+- Added a notice channel (`Notice` / `NoticeLevel`, `OverlayHandle::push_notice`) so problems are visible in release builds, which have no console. Identical consecutive notices are merged into one entry with a counter.
+- GUI: dismissible banner under the top bar showing the newest notice, plus an `Events` section in the `Live Log` tab. The version label now comes from `Cargo.toml`.
+- Reported as notices: reset/unreadable `config.json` (with `.bak` location), failed config saves, missing API key or failed engine start (silent Google fallback), per-line fallback to Google with the primary engine's error, translation/reload errors, capture/OCR errors, and failed OCR language switches.
+- Fixed `Quit` (tray / `Ctrl + Shift + Q`) leaving an invisible `overcap.exe` running when the GUI window was hidden in the tray: the process now force-exits 1 s after the overlay loop ends.
+- `Translator` trait gained `take_notice()` (default `None`); Groq, Gemini, and OpenAI-compatible translators use it to report why the fallback was used. `build_translator` now returns an optional warning next to the engine.
+
+### `v0.3.1` — Config Safety & Fallback Cache Fix
+- `AppConfig::load` no longer silently discards an unreadable `config.json`: the file is copied to `config.json.bak` before defaults are used, so API keys survive a typo. A leading UTF-8 BOM is now tolerated.
+- `AppConfig::save` writes to `config.json.tmp` and renames over the target, so a crash mid-write cannot truncate the config.
+- Groq, Gemini, and OpenAI-compatible translators no longer cache or record in the context history translations that came from the Google fallback.
 
 ### `v0.3.0` — Native Rust `egui` Desktop App, System Tray & Consoleless Mode
 - Replaced the local HTTP/browser settings server (`settings_ui.rs`) with a native `eframe` / `egui` desktop control center (`src/gui.rs`) featuring a Neutral Dark Graphite default theme, Light gray toggle, `EN`/`TR` language toggle, live subtitle preview strip, and 4 tabs (`Appearance`, `Engine`, `Profiles & OCR`, `Live Log`).

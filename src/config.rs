@@ -2,7 +2,7 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Region {
@@ -10,6 +10,74 @@ pub struct Region {
     pub top: i32,
     pub width: i32,
     pub height: i32,
+}
+
+/// Largest supported text outline width in pixels.
+pub const MAX_OUTLINE_WIDTH: i32 = 6;
+
+/// Everything that controls how the translated subtitle looks. Used live by the overlay,
+/// and stored per app in `AppConfig::profile_styles`. Missing fields fall back to defaults,
+/// so hand-edited or older entries keep loading.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OverlayStyle {
+    pub font_family: String,
+    pub font_size: i32,
+    pub font_bold: bool,
+    pub text_color: String,
+    pub bg_color: String,
+    /// Opacity of the background box only (0 = invisible, 255 = solid). Text is always opaque.
+    pub opacity: u8,
+    pub corner_radius: i32,
+    pub text_shadow: bool,
+    pub fit_to_text: bool,
+    pub padding_x: i32,
+    pub padding_y: i32,
+    pub outline_width: i32,
+    pub outline_color: String,
+}
+
+impl Default for OverlayStyle {
+    fn default() -> Self {
+        Self::from_config(&AppConfig::default())
+    }
+}
+
+impl OverlayStyle {
+    pub fn from_config(cfg: &AppConfig) -> Self {
+        Self {
+            font_family: cfg.font_family.clone(),
+            font_size: cfg.font_size,
+            font_bold: cfg.font_bold,
+            text_color: cfg.text_color.clone(),
+            bg_color: cfg.bg_color.clone(),
+            opacity: cfg.opacity,
+            corner_radius: cfg.corner_radius,
+            text_shadow: cfg.text_shadow,
+            fit_to_text: cfg.fit_to_text,
+            padding_x: cfg.padding_x,
+            padding_y: cfg.padding_y,
+            outline_width: cfg.outline_width,
+            outline_color: cfg.outline_color.clone(),
+        }
+    }
+
+    /// Writes this style into the global (non per-app) fields of `cfg`.
+    pub fn write_to_config(&self, cfg: &mut AppConfig) {
+        cfg.font_family = self.font_family.clone();
+        cfg.font_size = self.font_size;
+        cfg.font_bold = self.font_bold;
+        cfg.text_color = self.text_color.clone();
+        cfg.bg_color = self.bg_color.clone();
+        cfg.opacity = self.opacity;
+        cfg.corner_radius = self.corner_radius;
+        cfg.text_shadow = self.text_shadow;
+        cfg.fit_to_text = self.fit_to_text;
+        cfg.padding_x = self.padding_x;
+        cfg.padding_y = self.padding_y;
+        cfg.outline_width = self.outline_width;
+        cfg.outline_color = self.outline_color.clone();
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -37,6 +105,10 @@ pub struct AppConfig {
     pub padding_x: i32,
     #[serde(default = "default_padding_y")]
     pub padding_y: i32,
+    #[serde(default = "default_outline_width")]
+    pub outline_width: i32,
+    #[serde(default = "default_outline_color")]
+    pub outline_color: String,
     #[serde(default = "default_source_lang")]
     pub source_lang: String,
     #[serde(default = "default_target_lang")]
@@ -61,6 +133,9 @@ pub struct AppConfig {
     pub auto_profiles: bool,
     #[serde(default)]
     pub profiles: HashMap<String, Region>,
+    /// Per-app subtitle look, keyed like `profiles` (lowercase `.exe` name).
+    #[serde(default)]
+    pub profile_styles: HashMap<String, OverlayStyle>,
 }
 
 fn default_font_family() -> String {
@@ -105,6 +180,14 @@ fn default_padding_x() -> i32 {
 
 fn default_padding_y() -> i32 {
     10
+}
+
+fn default_outline_width() -> i32 {
+    0
+}
+
+fn default_outline_color() -> String {
+    "#000000".to_string()
 }
 
 fn default_source_lang() -> String {
@@ -154,6 +237,8 @@ impl Default for AppConfig {
             fit_to_text: default_fit_to_text(),
             padding_x: default_padding_x(),
             padding_y: default_padding_y(),
+            outline_width: default_outline_width(),
+            outline_color: default_outline_color(),
             source_lang: default_source_lang(),
             target_lang: default_target_lang(),
             engine: default_engine(),
@@ -166,6 +251,7 @@ impl Default for AppConfig {
             custom_model: default_custom_model(),
             auto_profiles: default_auto_profiles(),
             profiles: HashMap::new(),
+            profile_styles: HashMap::new(),
         }
     }
 }
@@ -194,20 +280,278 @@ impl AppConfig {
         exe_cfg.unwrap_or(cwd_cfg)
     }
 
-    pub fn load() -> Self {
-        let path = Self::path();
-        if let Ok(content) = fs::read_to_string(&path) {
-            if let Ok(cfg) = serde_json::from_str::<AppConfig>(&content) {
-                return cfg;
+    /// The style to use while `app` is in the foreground: its own style if per-app switching
+    /// is enabled and one exists, otherwise the global style.
+    pub fn style_for_app(&self, app: Option<&str>) -> OverlayStyle {
+        if self.auto_profiles {
+            if let Some(style) = app.and_then(|a| self.profile_styles.get(a)) {
+                return style.clone();
             }
         }
-        Self::default()
+        OverlayStyle::from_config(self)
+    }
+
+    /// Loads the default config path and returns a user-facing warning if the file had to be
+    /// discarded (see `load_checked`). The caller is expected to show the warning in the GUI.
+    pub fn load_with_notice() -> (Self, Option<String>) {
+        Self::load_checked(&Self::path())
+    }
+
+    #[cfg(test)]
+    pub fn load_from(path: &Path) -> Self {
+        Self::load_checked(path).0
+    }
+
+    /// Loads the config from `path`.
+    /// A missing file silently yields defaults (first run). A file that exists but cannot be
+    /// read or parsed is copied to `<path>.bak` first, so a later `save()` of the default
+    /// config can never destroy the user's API keys. In that case a warning is returned.
+    fn load_checked(path: &Path) -> (Self, Option<String>) {
+        let content = match fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(e) => {
+                if path.exists() {
+                    eprintln!("[Config ERROR] Cannot read {}: {e}", path.display());
+                    let notice = Self::discard_notice(path, &e.to_string());
+                    return (Self::default(), Some(notice));
+                }
+                return (Self::default(), None);
+            }
+        };
+
+        // Windows editors may prepend a UTF-8 BOM, which serde_json rejects.
+        match serde_json::from_str::<AppConfig>(content.trim_start_matches('\u{feff}')) {
+            Ok(cfg) => (cfg, None),
+            Err(e) => {
+                eprintln!("[Config ERROR] Cannot parse {}: {e}", path.display());
+                let notice = Self::discard_notice(path, &e.to_string());
+                (Self::default(), Some(notice))
+            }
+        }
+    }
+
+    /// Backs the unreadable file up and describes what happened.
+    fn discard_notice(path: &Path, reason: &str) -> String {
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "config.json".to_string());
+        let bak = sibling_with_suffix(path, ".bak");
+        match fs::copy(path, &bak) {
+            Ok(_) => {
+                eprintln!(
+                    "[Config] Backed up the unreadable config to {}.",
+                    bak.display()
+                );
+                format!(
+                    "{name} could not be loaded ({reason}). Settings were reset to defaults; \
+                     the original file, including API keys, was saved as {name}.bak."
+                )
+            }
+            Err(e) => {
+                eprintln!("[Config ERROR] Could not back up to {}: {e}", bak.display());
+                format!(
+                    "{name} could not be loaded ({reason}) and the backup to {name}.bak failed \
+                     ({e}). Settings were reset to defaults."
+                )
+            }
+        }
     }
 
     pub fn save(&self) -> Result<()> {
+        self.save_to(&Self::path())
+    }
+
+    /// Writes to `<path>.tmp` first and then renames over `path`, so a crash mid-write
+    /// leaves the previous config intact instead of a truncated file.
+    pub fn save_to(&self, path: &Path) -> Result<()> {
         let json = serde_json::to_string_pretty(self)?;
-        fs::write(Self::path(), json)?;
+        let tmp = sibling_with_suffix(path, ".tmp");
+        fs::write(&tmp, json)?;
+        if let Err(e) = fs::rename(&tmp, path) {
+            let _ = fs::remove_file(&tmp);
+            return Err(e.into());
+        }
         Ok(())
+    }
+}
+
+/// `config.json` + `.bak` -> `config.json.bak` (appends instead of replacing the extension).
+fn sibling_with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut s = path.as_os_str().to_owned();
+    s.push(suffix);
+    PathBuf::from(s)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("overcap-test-{}-{name}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn missing_file_yields_defaults_without_backup() {
+        let dir = temp_dir("missing");
+        let path = dir.join("config.json");
+        let cfg = AppConfig::load_from(&path);
+        assert_eq!(cfg.engine, default_engine());
+        assert!(!dir.join("config.json.bak").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn corrupt_file_is_backed_up_before_defaults() {
+        let dir = temp_dir("corrupt");
+        let path = dir.join("config.json");
+        let broken = r#"{ "groq_api_key": "gsk_secret" "engine": "groq" }"#;
+        fs::write(&path, broken).unwrap();
+
+        let cfg = AppConfig::load_from(&path);
+        assert!(cfg.groq_api_key.is_none());
+        assert_eq!(
+            fs::read_to_string(dir.join("config.json.bak")).unwrap(),
+            broken
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_then_load_roundtrip_leaves_no_tmp_file() {
+        let dir = temp_dir("roundtrip");
+        let path = dir.join("config.json");
+        let mut cfg = AppConfig::default();
+        cfg.groq_api_key = Some("gsk_test".to_string());
+        cfg.save_to(&path).unwrap();
+        // Overwriting an existing file must also work (rename replaces the target).
+        cfg.font_size = 40;
+        cfg.save_to(&path).unwrap();
+
+        let loaded = AppConfig::load_from(&path);
+        assert_eq!(loaded.groq_api_key.as_deref(), Some("gsk_test"));
+        assert_eq!(loaded.font_size, 40);
+        assert!(!dir.join("config.json.tmp").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn notice_is_returned_only_when_a_file_was_discarded() {
+        let dir = temp_dir("notice");
+        let path = dir.join("config.json");
+
+        let (_, notice) = AppConfig::load_checked(&path);
+        assert!(notice.is_none(), "missing file is a normal first run");
+
+        fs::write(&path, "{ not json").unwrap();
+        let (_, notice) = AppConfig::load_checked(&path);
+        let notice = notice.expect("corrupt file must produce a notice");
+        assert!(notice.contains("config.json.bak"), "{notice}");
+
+        fs::write(&path, "{\"font_size\": 30}").unwrap();
+        let (cfg, notice) = AppConfig::load_checked(&path);
+        assert_eq!(cfg.font_size, 30);
+        assert!(notice.is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn old_config_without_new_style_fields_still_loads() {
+        let dir = temp_dir("oldcfg");
+        let path = dir.join("config.json");
+        // A v0.4.0 era file: no outline_*, no profile_styles.
+        fs::write(
+            &path,
+            r##"{"font_size": 31, "opacity": 200, "profiles": {}}"##,
+        )
+        .unwrap();
+        let (cfg, notice) = AppConfig::load_checked(&path);
+        assert!(notice.is_none());
+        assert_eq!(cfg.font_size, 31);
+        assert_eq!(cfg.outline_width, 0);
+        assert_eq!(cfg.outline_color, "#000000");
+        assert!(cfg.profile_styles.is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn partial_app_style_entry_fills_in_defaults() {
+        let json = r##"{"profile_styles": {"game.exe": {"font_size": 40, "outline_width": 3}}}"##;
+        let cfg: AppConfig = serde_json::from_str(json).unwrap();
+        let style = &cfg.profile_styles["game.exe"];
+        assert_eq!(style.font_size, 40);
+        assert_eq!(style.outline_width, 3);
+        assert_eq!(style.text_color, default_text_color());
+        assert_eq!(style.opacity, default_opacity());
+    }
+
+    #[test]
+    fn style_for_app_prefers_app_style_only_when_auto_profiles_is_on() {
+        let mut cfg = AppConfig::default();
+        let custom = OverlayStyle {
+            font_size: 44,
+            ..OverlayStyle::default()
+        };
+        cfg.profile_styles
+            .insert("game.exe".to_string(), custom.clone());
+
+        assert_eq!(cfg.style_for_app(Some("game.exe")), custom);
+        assert_eq!(
+            cfg.style_for_app(Some("other.exe")).font_size,
+            cfg.font_size
+        );
+        assert_eq!(cfg.style_for_app(None).font_size, cfg.font_size);
+
+        cfg.auto_profiles = false;
+        assert_eq!(cfg.style_for_app(Some("game.exe")).font_size, cfg.font_size);
+    }
+
+    #[test]
+    fn app_styles_survive_a_save_load_roundtrip() {
+        let dir = temp_dir("appstyle");
+        let path = dir.join("config.json");
+        let mut cfg = AppConfig::default();
+        cfg.profile_styles.insert(
+            "game.exe".to_string(),
+            OverlayStyle {
+                outline_width: 4,
+                outline_color: "#FF0000".to_string(),
+                ..OverlayStyle::default()
+            },
+        );
+        cfg.save_to(&path).unwrap();
+        let loaded = AppConfig::load_from(&path);
+        assert_eq!(loaded.profile_styles["game.exe"].outline_width, 4);
+        assert_eq!(loaded.profile_styles["game.exe"].outline_color, "#FF0000");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_to_config_updates_only_global_style_fields() {
+        let mut cfg = AppConfig::default();
+        let style = OverlayStyle {
+            font_size: 50,
+            outline_width: 2,
+            ..OverlayStyle::default()
+        };
+        style.write_to_config(&mut cfg);
+        assert_eq!(cfg.font_size, 50);
+        assert_eq!(cfg.outline_width, 2);
+        assert_eq!(OverlayStyle::from_config(&cfg), style);
+    }
+
+    #[test]
+    fn utf8_bom_is_tolerated() {
+        let dir = temp_dir("bom");
+        let path = dir.join("config.json");
+        fs::write(&path, "\u{feff}{\"font_size\": 33}").unwrap();
+        let cfg = AppConfig::load_from(&path);
+        assert_eq!(cfg.font_size, 33);
+        assert!(!dir.join("config.json.bak").exists());
+        let _ = fs::remove_dir_all(&dir);
     }
 }
 

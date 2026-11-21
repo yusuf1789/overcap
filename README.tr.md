@@ -136,7 +136,8 @@ veya doğrudan:
 - `src/capture.rs` — GDI `BitBlt` bölge yakalama, parlak piksel değişim maskesi ve 2x upscale.
 - `src/ocr.rs` — `Windows.Media.Ocr` sarmalayıcısı, satır sıralama ve `BoundingRect` hesabı.
 - `src/translator.rs` — `Translator` trait'i (`GroqTranslator`, `GeminiTranslator`, `GoogleTranslator`), önbellek ve akıllı tekrar filtresi.
-- `src/overlay.rs` — `WDA_EXCLUDEFROMCAPTURE` + click-through Win32 overlay, dinamik Auto-Fit, yuvarlatılmış köşe, sistem tepsisi yönlendirmesi ve global kısayollar.
+- `src/render.rs` — Piksel başına alfa ile overlay çizimi: şeffaflaştırılabilir arka plan kutusu, yazı konturu ve gölgesi, her zaman opak yazı.
+- `src/overlay.rs` — `WDA_EXCLUDEFROMCAPTURE` + click-through Win32 overlay, dinamik Auto-Fit, uygulama başına stil, sistem tepsisi yönlendirmesi ve global kısayollar.
 - `src/selector.rs` — High-DPI, çoklu monitör uyumlu Win32 bölge seçici.
 - `src/gui.rs` — Yerel `eframe`/`egui` masaüstü kontrol merkezi ve canlı önizleme arayüzü.
 - `src/tray.rs` — Yerel Win32 Sistem Tepsisi ikonu ve sağ tık menüsü.

@@ -8,9 +8,9 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::config::AppConfig;
+use crate::config::{AppConfig, OverlayStyle, MAX_OUTLINE_WIDTH};
 use crate::ocr::{available_ocr_languages, is_language_installed};
-use crate::overlay::{OverlayHandle, OverlayStyle};
+use crate::overlay::{NoticeLevel, OverlayHandle};
 use crate::tray;
 
 const FONT_FAMILIES: &[&str] = &[
@@ -28,6 +28,7 @@ const ENGINES: &[&str] = &["groq", "gemini", "openai-compat", "google"];
 
 const TEXT_SWATCHES: &[&str] = &["#FFFFFF", "#FFE55C", "#E2E8F0", "#D4D4D4"];
 const BG_SWATCHES: &[&str] = &["#0A0A0C", "#000000", "#121212", "#242424"];
+const OUTLINE_SWATCHES: &[&str] = &["#000000", "#141414", "#FFFFFF"];
 
 const SAMPLES_EN: &[&str] = &[
     "We need to get out of here before they find us. Stay low and follow me!",
@@ -100,28 +101,126 @@ impl Palette {
             text_muted: Color32::from_rgb(142, 142, 142),   // #8E8E8E
             accent: Color32::from_rgb(224, 224, 224),       // #E0E0E0
             accent_text: Color32::from_rgb(20, 20, 20),
-            status_green: Color32::from_rgb(63, 185, 80),   // #3FB950
-            status_amber: Color32::from_rgb(210, 153, 34),  // #D29922
-            status_red: Color32::from_rgb(248, 81, 73),     // #F85149
+            status_green: Color32::from_rgb(63, 185, 80), // #3FB950
+            status_amber: Color32::from_rgb(210, 153, 34), // #D29922
+            status_red: Color32::from_rgb(248, 81, 73),   // #F85149
         }
     }
 
     fn light() -> Self {
         Self {
-            window_bg: Color32::from_rgb(236, 236, 236),    // #ECECEC
-            surface_bg: Color32::from_rgb(247, 247, 247),   // #F7F7F7
-            input_bg: Color32::from_rgb(255, 255, 255),     // #FFFFFF
-            hover_bg: Color32::from_rgb(226, 226, 226),     // #E2E2E2
-            active_bg: Color32::from_rgb(212, 212, 212),    // #D4D4D4
-            border: Color32::from_rgb(208, 208, 208),       // #D0D0D0
-            text_primary: Color32::from_rgb(26, 26, 26),    // #1A1A1A
-            text_muted: Color32::from_rgb(98, 98, 98),      // #626262
-            accent: Color32::from_rgb(46, 46, 46),          // #2E2E2E
+            window_bg: Color32::from_rgb(236, 236, 236),  // #ECECEC
+            surface_bg: Color32::from_rgb(247, 247, 247), // #F7F7F7
+            input_bg: Color32::from_rgb(255, 255, 255),   // #FFFFFF
+            hover_bg: Color32::from_rgb(226, 226, 226),   // #E2E2E2
+            active_bg: Color32::from_rgb(212, 212, 212),  // #D4D4D4
+            border: Color32::from_rgb(208, 208, 208),     // #D0D0D0
+            text_primary: Color32::from_rgb(26, 26, 26),  // #1A1A1A
+            text_muted: Color32::from_rgb(98, 98, 98),    // #626262
+            accent: Color32::from_rgb(46, 46, 46),        // #2E2E2E
             accent_text: Color32::from_rgb(247, 247, 247),
             status_green: Color32::from_rgb(45, 148, 62),
             status_amber: Color32::from_rgb(176, 124, 20),
             status_red: Color32::from_rgb(208, 52, 44),
         }
+    }
+}
+
+const LABEL_COL_W: f32 = 120.0;
+
+fn section_header(ui: &mut egui::Ui, pal: Palette, text: &str) {
+    ui.label(
+        RichText::new(text.to_uppercase())
+            .font(FontId::new(11.0, FontFamily::Monospace))
+            .color(pal.text_muted),
+    );
+    ui.separator();
+}
+
+/// Fixed-width label so every control in a column lines up.
+fn row_label(ui: &mut egui::Ui, text: &str) {
+    ui.allocate_ui_with_layout(
+        egui::vec2(LABEL_COL_W, 20.0),
+        Layout::left_to_right(Align::Center),
+        |ui| {
+            ui.label(text);
+        },
+    );
+}
+
+/// `label | slider | value`. Returns true when the value changed.
+fn slider_row(
+    ui: &mut egui::Ui,
+    pal: Palette,
+    label: &str,
+    value: &mut i32,
+    range: std::ops::RangeInclusive<i32>,
+    format: impl Fn(i32) -> String,
+) -> bool {
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        row_label(ui, label);
+        ui.spacing_mut().slider_width = 150.0;
+        changed = ui
+            .add(egui::Slider::new(value, range).show_value(false))
+            .changed();
+        ui.add_sized(
+            [56.0, 20.0],
+            egui::Label::new(
+                RichText::new(format(*value))
+                    .font(FontId::new(12.0, FontFamily::Monospace))
+                    .color(pal.text_muted),
+            ),
+        );
+    });
+    changed
+}
+
+/// `label | color picker | #hex | swatches`. Returns true when the color changed.
+fn color_row(
+    ui: &mut egui::Ui,
+    pal: Palette,
+    label: &str,
+    hex: &mut String,
+    swatches: &[&str],
+    fallback: [u8; 3],
+) -> bool {
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        row_label(ui, label);
+        let mut rgb = parse_hex_rgb(hex, fallback);
+        if ui.color_edit_button_srgb(&mut rgb).changed() {
+            *hex = rgb_to_hex(rgb);
+            changed = true;
+        }
+        ui.label(
+            RichText::new(hex.as_str())
+                .font(FontId::new(11.5, FontFamily::Monospace))
+                .color(pal.text_muted),
+        );
+        for sw in swatches {
+            let c = parse_hex_rgb(sw, fallback);
+            let (rect, resp) = ui.allocate_exact_size(Vec2::splat(16.0), Sense::click());
+            ui.painter().rect_filled(
+                rect,
+                Rounding::same(2.0),
+                Color32::from_rgb(c[0], c[1], c[2]),
+            );
+            ui.painter()
+                .rect_stroke(rect, Rounding::same(2.0), Stroke::new(1.0_f32, pal.border));
+            if resp.clicked() {
+                *hex = (*sw).to_string();
+                changed = true;
+            }
+        }
+    });
+    changed
+}
+
+fn notice_color(pal: Palette, level: NoticeLevel) -> Color32 {
+    match level {
+        NoticeLevel::Warning => pal.status_amber,
+        NoticeLevel::Error => pal.status_red,
     }
 }
 
@@ -220,8 +319,10 @@ struct OvercapApp {
     sample_idx: usize,
     overlay_preview_on: bool,
 
-    // Live style state (synced with OverlayHandle)
+    // Live style state, mirrored from config.json (global style or the `editing_app` style)
     style: OverlayStyle,
+    // `Some(exe)` while the Appearance tab edits that app's own style instead of the global one.
+    editing_app: Option<String>,
 
     // Editable Engine tab state
     engine: String,
@@ -244,6 +345,9 @@ struct OvercapApp {
     installed_ocr_langs: Vec<String>,
     source_ocr_installed: bool,
     last_checked_ocr_lang: String,
+
+    // Notices with an id <= this value were dismissed from the banner.
+    dismissed_notice_id: u64,
 }
 
 fn load_windows_preview_fonts(ctx: &egui::Context) {
@@ -320,6 +424,7 @@ impl OvercapApp {
             sample_idx: 0,
             overlay_preview_on: false,
             style,
+            editing_app: None,
             engine: cfg.engine,
             source_lang: cfg.source_lang.clone(),
             target_lang: cfg.target_lang,
@@ -350,6 +455,7 @@ impl OvercapApp {
             installed_ocr_langs,
             source_ocr_installed,
             last_checked_ocr_lang: cfg.source_lang,
+            dismissed_notice_id: 0,
         }
     }
 
@@ -375,14 +481,51 @@ impl OvercapApp {
         }
     }
 
+    /// config.json (via the handle) is the source of truth for what the Appearance tab shows,
+    /// so changes made elsewhere (font-size hotkeys, removing an app style) show up here too.
     fn sync_from_handle_if_needed(&mut self) {
-        // Keep font_size / auto_profiles in sync if changed by global hotkeys.
-        if let Ok(st) = self.handle.state.lock() {
-            if st.style.font_size != self.style.font_size {
-                self.style.font_size = st.style.font_size;
+        let cfg = self.handle.snapshot_config();
+        self.auto_profiles = cfg.auto_profiles;
+
+        if let Some(app) = &self.editing_app {
+            if !cfg.profile_styles.contains_key(app) {
+                self.editing_app = None;
             }
-            self.auto_profiles = st.config.auto_profiles;
         }
+        self.style = match self
+            .editing_app
+            .as_ref()
+            .and_then(|app| cfg.profile_styles.get(app))
+        {
+            Some(style) => style.clone(),
+            None => OverlayStyle::from_config(&cfg),
+        };
+    }
+
+    /// Applies `self.style` live and stores it in the scope being edited.
+    fn commit_style(&mut self) {
+        match self.editing_app.clone() {
+            Some(app) => self.handle.apply_app_style(&app, self.style.clone()),
+            None => self.handle.apply_style(self.style.clone(), true),
+        }
+    }
+
+    /// Switches what the Appearance tab edits. Selecting an app that has no style yet creates
+    /// one from the current global style.
+    fn set_style_scope(&mut self, app: Option<String>) {
+        let cfg = self.handle.snapshot_config();
+        match &app {
+            Some(name) => match cfg.profile_styles.get(name) {
+                Some(existing) => self.handle.apply_style(existing.clone(), false),
+                None => self
+                    .handle
+                    .apply_app_style(name, OverlayStyle::from_config(&cfg)),
+            },
+            None => self
+                .handle
+                .apply_style(OverlayStyle::from_config(&cfg), false),
+        }
+        self.editing_app = app;
     }
 
     fn refresh_ocr_diagnostics(&mut self) {
@@ -392,60 +535,43 @@ impl OvercapApp {
     }
 
     fn apply_preset(&mut self, name: &str) {
-        let (family, size, bold, text, bg, opacity, radius, shadow, fit, px, py) = match name {
-            "cinema" => (
-                "Bahnschrift",
-                30,
-                true,
-                "#FFFFFF",
-                "#0A0A0C",
-                225,
-                10,
-                true,
-                true,
-                18,
-                8,
-            ),
-            "yellow" => (
-                "Trebuchet MS",
-                30,
-                true,
-                "#FFE55C",
-                "#08080A",
-                220,
-                8,
-                true,
-                true,
-                16,
-                8,
-            ),
-            "minimal" => (
-                "Segoe UI",
-                28,
-                false,
-                "#F5F5F5",
-                "#121212",
-                185,
-                12,
-                true,
-                true,
-                14,
-                6,
-            ),
-            _ => (
-                "Segoe UI",
-                32,
-                true,
-                "#FFFFFF",
-                "#000000",
-                250,
-                4,
-                false,
-                false,
-                20,
-                10,
-            ),
-        };
+        let (family, size, bold, text, bg, opacity, radius, shadow, fit, px, py, outline) =
+            match name {
+                "cinema" => (
+                    "Bahnschrift",
+                    30,
+                    true,
+                    "#FFFFFF",
+                    "#0A0A0C",
+                    225,
+                    10,
+                    true,
+                    true,
+                    18,
+                    8,
+                    0,
+                ),
+                "yellow" => (
+                    "Trebuchet MS",
+                    30,
+                    true,
+                    "#FFE55C",
+                    "#08080A",
+                    220,
+                    8,
+                    true,
+                    true,
+                    16,
+                    8,
+                    1,
+                ),
+                "minimal" => (
+                    "Segoe UI", 28, false, "#F5F5F5", "#121212", 185, 12, true, true, 14, 6, 0,
+                ),
+                _ => (
+                    "Segoe UI", 32, true, "#FFFFFF", "#000000", 250, 4, false, false, 20, 10, 2,
+                ),
+            };
 
         self.style = OverlayStyle {
             font_family: family.to_string(),
@@ -459,8 +585,10 @@ impl OvercapApp {
             fit_to_text: fit,
             padding_x: px,
             padding_y: py,
+            outline_width: outline,
+            outline_color: "#000000".to_string(),
         };
-        self.handle.apply_style(self.style.clone(), true);
+        self.commit_style();
     }
 
     fn save_and_reload_engine(&mut self) {
@@ -524,7 +652,7 @@ impl OvercapApp {
                     .color(pal.text_primary),
             );
             ui.label(
-                RichText::new("v0.3.0")
+                RichText::new(concat!("v", env!("CARGO_PKG_VERSION")))
                     .font(FontId::new(11.5, FontFamily::Monospace))
                     .color(pal.text_muted),
             );
@@ -537,7 +665,10 @@ impl OvercapApp {
                     self.t("Missing OCR", "OCR Eksik").to_string(),
                 )
             } else if is_paused {
-                (pal.status_amber, self.t("Paused", "Duraklatildi").to_string())
+                (
+                    pal.status_amber,
+                    self.t("Paused", "Duraklatildi").to_string(),
+                )
             } else if latency > 0 {
                 (
                     pal.status_green,
@@ -600,10 +731,7 @@ impl OvercapApp {
                     self.handle.toggle_pause();
                 }
 
-                if ui
-                    .button(self.t("Select Region", "Bolge Sec"))
-                    .clicked()
-                {
+                if ui.button(self.t("Select Region", "Bolge Sec")).clicked() {
                     self.handle.trigger_reselect();
                 }
             });
@@ -631,23 +759,23 @@ impl OvercapApp {
                         (StageBg::Light, self.t("Light", "Acik")),
                     ] {
                         let selected = self.stage_bg == bg;
-                        let btn = egui::Button::new(
-                            RichText::new(label).size(11.5).color(if selected {
+                        let btn =
+                            egui::Button::new(RichText::new(label).size(11.5).color(if selected {
                                 pal.accent_text
                             } else {
                                 pal.text_primary
-                            }),
-                        )
-                        .fill(if selected { pal.accent } else { pal.input_bg });
+                            }))
+                            .fill(if selected {
+                                pal.accent
+                            } else {
+                                pal.input_bg
+                            });
                         if ui.add(btn).clicked() {
                             self.stage_bg = bg;
                         }
                     }
 
-                    if ui
-                        .button(self.t("Next Sample", "Sonraki Ornek"))
-                        .clicked()
-                    {
+                    if ui.button(self.t("Next Sample", "Sonraki Ornek")).clicked() {
                         self.sample_idx = (self.sample_idx + 1) % SAMPLES_EN.len();
                         if self.overlay_preview_on {
                             self.handle
@@ -661,15 +789,13 @@ impl OvercapApp {
                         } else {
                             self.t("Overlay Preview: OFF", "Ekran Onizleme: KAPALI")
                         };
-                        let btn = egui::Button::new(
-                            RichText::new(preview_lbl).size(11.5).color(
-                                if self.overlay_preview_on {
-                                    pal.accent_text
-                                } else {
-                                    pal.text_primary
-                                },
-                            ),
-                        )
+                        let btn = egui::Button::new(RichText::new(preview_lbl).size(11.5).color(
+                            if self.overlay_preview_on {
+                                pal.accent_text
+                            } else {
+                                pal.text_primary
+                            },
+                        ))
                         .fill(if self.overlay_preview_on {
                             pal.accent
                         } else {
@@ -712,10 +838,8 @@ impl OvercapApp {
                 let rounding = Rounding::same((self.style.corner_radius as f32).min(32.0));
 
                 let stage_h = 136.0;
-                let (stage_rect, _) = ui.allocate_exact_size(
-                    egui::vec2(ui.available_width(), stage_h),
-                    Sense::hover(),
-                );
+                let (stage_rect, _) = ui
+                    .allocate_exact_size(egui::vec2(ui.available_width(), stage_h), Sense::hover());
                 let painter = ui.painter_at(stage_rect);
                 painter.rect(
                     stage_rect,
@@ -730,12 +854,8 @@ impl OvercapApp {
                 let sample = self.current_sample();
                 let max_wrap_w = (stage_rect.width() - 36.0 - pad_x * 2.0).max(120.0);
 
-                let text_galley = painter.layout(
-                    sample.to_string(),
-                    font_id.clone(),
-                    sub_fg,
-                    max_wrap_w,
-                );
+                let text_galley =
+                    painter.layout(sample.to_string(), font_id.clone(), sub_fg, max_wrap_w);
                 let text_size = text_galley.size();
 
                 let box_w = if self.style.fit_to_text {
@@ -747,28 +867,62 @@ impl OvercapApp {
                     .min(stage_rect.height() - 14.0)
                     .max(28.0);
 
-                let box_rect = egui::Rect::from_center_size(
-                    stage_rect.center(),
-                    egui::vec2(box_w, box_h),
-                );
+                let box_rect =
+                    egui::Rect::from_center_size(stage_rect.center(), egui::vec2(box_w, box_h));
                 painter.rect_filled(box_rect, rounding, sub_bg);
 
                 let text_pos = egui::pos2(
                     box_rect.center().x - text_size.x * 0.5,
                     box_rect.center().y - text_size.y * 0.5,
                 );
+                // Same layer order as the real overlay: shadow, outline, text.
+                let outline_rgb = parse_hex_rgb(&self.style.outline_color, [0, 0, 0]);
+                let outline_col = Color32::from_rgb(outline_rgb[0], outline_rgb[1], outline_rgb[2]);
+                let outline_px = if self.style.outline_width > 0 {
+                    (self.style.outline_width as f32 * 0.82).max(1.0)
+                } else {
+                    0.0
+                };
+                const RING: [(f32, f32); 8] = [
+                    (1.0, 0.0),
+                    (0.707, 0.707),
+                    (0.0, 1.0),
+                    (-0.707, 0.707),
+                    (-1.0, 0.0),
+                    (-0.707, -0.707),
+                    (0.0, -1.0),
+                    (0.707, -0.707),
+                ];
+
                 if self.style.text_shadow {
                     let shadow_galley = painter.layout(
                         sample.to_string(),
-                        font_id,
+                        font_id.clone(),
                         Color32::from_rgba_unmultiplied(0, 0, 0, 220),
                         max_wrap_w,
                     );
-                    painter.galley(
-                        text_pos + egui::vec2(2.0, 2.0),
-                        shadow_galley,
-                        Color32::BLACK,
-                    );
+                    let shadow_pos = text_pos + egui::vec2(2.0, 2.0);
+                    if outline_px > 0.0 {
+                        for (dx, dy) in RING {
+                            painter.galley(
+                                shadow_pos + egui::vec2(dx, dy) * outline_px,
+                                shadow_galley.clone(),
+                                Color32::BLACK,
+                            );
+                        }
+                    }
+                    painter.galley(shadow_pos, shadow_galley, Color32::BLACK);
+                }
+                if outline_px > 0.0 {
+                    let outline_galley =
+                        painter.layout(sample.to_string(), font_id, outline_col, max_wrap_w);
+                    for (dx, dy) in RING {
+                        painter.galley(
+                            text_pos + egui::vec2(dx, dy) * outline_px,
+                            outline_galley.clone(),
+                            outline_col,
+                        );
+                    }
                 }
                 painter.galley(text_pos, text_galley, sub_fg);
             });
@@ -823,6 +977,89 @@ impl OvercapApp {
         ui.add_space(6.0);
     }
 
+    /// "Style for: [Global] [game.exe] [Remove]" selector above the presets.
+    fn render_style_scope(&mut self, ui: &mut egui::Ui, pal: Palette) {
+        let mut apps: Vec<String> = Vec::new();
+        for app in [self.editing_app.clone(), self.handle.last_app()]
+            .into_iter()
+            .flatten()
+        {
+            if !apps.contains(&app) {
+                apps.push(app);
+            }
+        }
+
+        let mut next_scope: Option<Option<String>> = None;
+        let mut remove_app: Option<String> = None;
+
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            ui.label(
+                RichText::new(self.t("Style for", "Stil"))
+                    .size(12.5)
+                    .color(pal.text_muted),
+            );
+
+            let scope_button = |ui: &mut egui::Ui, label: &str, selected: bool| -> bool {
+                let btn = egui::Button::new(RichText::new(label).size(11.5).color(if selected {
+                    pal.accent_text
+                } else {
+                    pal.text_primary
+                }))
+                .fill(if selected { pal.accent } else { pal.input_bg });
+                ui.add(btn).clicked()
+            };
+
+            if scope_button(ui, self.t("Global", "Genel"), self.editing_app.is_none())
+                && self.editing_app.is_some()
+            {
+                next_scope = Some(None);
+            }
+            for app in &apps {
+                let selected = self.editing_app.as_deref() == Some(app.as_str());
+                if scope_button(ui, app, selected) && !selected {
+                    next_scope = Some(Some(app.clone()));
+                }
+            }
+
+            if let Some(app) = &self.editing_app {
+                if ui
+                    .button(self.t("Remove App Style", "Uygulama Stilini Sil"))
+                    .clicked()
+                {
+                    remove_app = Some(app.clone());
+                }
+            }
+        });
+
+        if self.editing_app.is_none() && apps.is_empty() {
+            ui.label(
+                RichText::new(self.t(
+                    "Focus a game or video player once to give it its own subtitle style.",
+                    "Bir oyun veya oynatici odaklandiginda ona ozel altyazi stili verebilirsin.",
+                ))
+                .size(11.5)
+                .color(pal.text_muted),
+            );
+        } else if !self.auto_profiles {
+            ui.label(
+                RichText::new(self.t(
+                    "Per-app styles are ignored while Auto-Switch by App is off.",
+                    "Uygulama stilleri, Auto-Switch by App kapaliyken kullanilmaz.",
+                ))
+                .size(11.5)
+                .color(pal.status_amber),
+            );
+        }
+
+        if let Some(app) = remove_app {
+            self.handle.remove_app_style(&app);
+            self.editing_app = None;
+        } else if let Some(scope) = next_scope {
+            self.set_style_scope(scope);
+        }
+    }
+
     fn render_appearance_tab(&mut self, ui: &mut egui::Ui, pal: Palette) {
         let lang = self.ui_lang;
         let mut changed = false;
@@ -833,6 +1070,9 @@ impl OvercapApp {
             .rounding(Rounding::same(4.0))
             .inner_margin(Margin::symmetric(12.0, 10.0))
             .show(ui, |ui| {
+                self.render_style_scope(ui, pal);
+                ui.add_space(8.0);
+
                 ui.horizontal(|ui| {
                     ui.label(
                         RichText::new(self.t("Presets", "Hazir Stiller"))
@@ -852,252 +1092,155 @@ impl OvercapApp {
                     }
                 });
 
-                ui.add_space(10.0);
+                ui.add_space(12.0);
 
-                egui::Grid::new("appearance_grid")
-                    .num_columns(2)
-                    .spacing([24.0, 10.0])
-                    .min_col_width(280.0)
-                    .show(ui, |ui| {
-                        // Row 1: Font Family | Font Size
+                ui.columns(2, |cols| {
+                    // Left column: Text, then Effects.
+                    {
+                        let ui = &mut cols[0];
+                        ui.spacing_mut().item_spacing.y = 8.0;
+
+                        section_header(ui, pal, tr(lang, "Text", "Yazi"));
+
                         ui.horizontal(|ui| {
-                            ui.label(self.t("Font Family", "Font Family"));
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                ComboBox::from_id_salt("font_family_combo")
-                                    .selected_text(&self.style.font_family)
-                                    .width(160.0)
-                                    .show_ui(ui, |ui| {
-                                        for fam in FONT_FAMILIES {
-                                            if ui
-                                                .selectable_value(
-                                                    &mut self.style.font_family,
-                                                    (*fam).to_string(),
-                                                    *fam,
-                                                )
-                                                .changed()
-                                            {
-                                                changed = true;
-                                            }
+                            row_label(ui, tr(lang, "Font Family", "Font Family"));
+                            ComboBox::from_id_salt("font_family_combo")
+                                .selected_text(&self.style.font_family)
+                                .width(150.0)
+                                .show_ui(ui, |ui| {
+                                    for fam in FONT_FAMILIES {
+                                        if ui
+                                            .selectable_value(
+                                                &mut self.style.font_family,
+                                                (*fam).to_string(),
+                                                *fam,
+                                            )
+                                            .changed()
+                                        {
+                                            changed = true;
                                         }
-                                    });
-                            });
+                                    }
+                                });
                         });
-
+                        changed |= slider_row(
+                            ui,
+                            pal,
+                            tr(lang, "Font Size", "Font Size"),
+                            &mut self.style.font_size,
+                            14..=64,
+                            |v| format!("{v} px"),
+                        );
+                        changed |= color_row(
+                            ui,
+                            pal,
+                            tr(lang, "Text Color", "Text Color"),
+                            &mut self.style.text_color,
+                            TEXT_SWATCHES,
+                            [255, 255, 255],
+                        );
                         ui.horizontal(|ui| {
-                            ui.label(self.t("Font Size", "Font Size"));
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                ui.label(
-                                    RichText::new(format!("{} px", self.style.font_size))
-                                        .font(FontId::new(12.0, FontFamily::Monospace))
-                                        .color(pal.text_muted),
-                                );
-                                if ui
-                                    .add(
-                                        egui::Slider::new(&mut self.style.font_size, 14..=64)
-                                            .show_value(false),
-                                    )
-                                    .changed()
-                                {
-                                    changed = true;
-                                }
-                            });
-                        });
-                        ui.end_row();
-
-                        // Row 2: Bold | Text Shadow
-                        ui.horizontal(|ui| {
-                            if ui
+                            row_label(ui, "");
+                            changed |= ui
                                 .checkbox(&mut self.style.font_bold, tr(lang, "Bold", "Bold"))
-                                .changed()
-                            {
-                                changed = true;
-                            }
+                                .changed();
                         });
+
+                        ui.add_space(10.0);
+                        section_header(ui, pal, tr(lang, "Effects", "Efektler"));
+
                         ui.horizontal(|ui| {
-                            if ui
+                            row_label(ui, "");
+                            changed |= ui
                                 .checkbox(
                                     &mut self.style.text_shadow,
                                     tr(lang, "Text Shadow", "Text Shadow"),
                                 )
-                                .changed()
-                            {
-                                changed = true;
-                            }
+                                .changed();
                         });
-                        ui.end_row();
+                        changed |= slider_row(
+                            ui,
+                            pal,
+                            tr(lang, "Outline Width", "Outline Width"),
+                            &mut self.style.outline_width,
+                            0..=MAX_OUTLINE_WIDTH,
+                            |v| format!("{v} px"),
+                        );
+                        changed |= color_row(
+                            ui,
+                            pal,
+                            tr(lang, "Outline Color", "Outline Color"),
+                            &mut self.style.outline_color,
+                            OUTLINE_SWATCHES,
+                            [0, 0, 0],
+                        );
+                    }
 
-                        // Row 3: Text Color | Background Color
-                        ui.horizontal(|ui| {
-                            ui.label(self.t("Text Color", "Text Color"));
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                for hex in TEXT_SWATCHES.iter().rev() {
-                                    let rgb = parse_hex_rgb(hex, [255, 255, 255]);
-                                    let c = Color32::from_rgb(rgb[0], rgb[1], rgb[2]);
-                                    let (rect, resp) =
-                                        ui.allocate_exact_size(Vec2::splat(16.0), Sense::click());
-                                    ui.painter().rect_filled(rect, Rounding::same(2.0), c);
-                                    ui.painter().rect_stroke(
-                                        rect,
-                                        Rounding::same(2.0),
-                                        Stroke::new(1.0_f32, pal.border),
-                                    );
-                                    if resp.clicked() {
-                                        self.style.text_color = (*hex).to_string();
-                                        changed = true;
-                                    }
-                                }
-                                let mut rgb =
-                                    parse_hex_rgb(&self.style.text_color, [255, 255, 255]);
-                                if ui.color_edit_button_srgb(&mut rgb).changed() {
-                                    self.style.text_color = rgb_to_hex(rgb);
-                                    changed = true;
-                                }
-                                ui.label(
-                                    RichText::new(&self.style.text_color)
-                                        .font(FontId::new(11.5, FontFamily::Monospace))
-                                        .color(pal.text_muted),
-                                );
-                            });
-                        });
+                    // Right column: the background box.
+                    {
+                        let ui = &mut cols[1];
+                        ui.spacing_mut().item_spacing.y = 8.0;
 
-                        ui.horizontal(|ui| {
-                            ui.label(self.t("Background Color", "Background Color"));
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                for hex in BG_SWATCHES.iter().rev() {
-                                    let rgb = parse_hex_rgb(hex, [10, 10, 12]);
-                                    let c = Color32::from_rgb(rgb[0], rgb[1], rgb[2]);
-                                    let (rect, resp) =
-                                        ui.allocate_exact_size(Vec2::splat(16.0), Sense::click());
-                                    ui.painter().rect_filled(rect, Rounding::same(2.0), c);
-                                    ui.painter().rect_stroke(
-                                        rect,
-                                        Rounding::same(2.0),
-                                        Stroke::new(1.0_f32, pal.border),
-                                    );
-                                    if resp.clicked() {
-                                        self.style.bg_color = (*hex).to_string();
-                                        changed = true;
-                                    }
-                                }
-                                let mut rgb = parse_hex_rgb(&self.style.bg_color, [10, 10, 12]);
-                                if ui.color_edit_button_srgb(&mut rgb).changed() {
-                                    self.style.bg_color = rgb_to_hex(rgb);
-                                    changed = true;
-                                }
-                                ui.label(
-                                    RichText::new(&self.style.bg_color)
-                                        .font(FontId::new(11.5, FontFamily::Monospace))
-                                        .color(pal.text_muted),
-                                );
-                            });
-                        });
-                        ui.end_row();
+                        section_header(ui, pal, tr(lang, "Box", "Kutu"));
 
-                        // Row 4: Opacity | Border Radius
+                        changed |= color_row(
+                            ui,
+                            pal,
+                            tr(lang, "Background Color", "Background Color"),
+                            &mut self.style.bg_color,
+                            BG_SWATCHES,
+                            [10, 10, 12],
+                        );
+                        let mut opacity = self.style.opacity as i32;
+                        if slider_row(
+                            ui,
+                            pal,
+                            tr(lang, "Background Opacity", "Arkaplan Opakligi"),
+                            &mut opacity,
+                            0..=255,
+                            |v| format!("{}%", ((v as f32 / 255.0) * 100.0).round() as i32),
+                        ) {
+                            self.style.opacity = opacity.clamp(0, 255) as u8;
+                            changed = true;
+                        }
+                        changed |= slider_row(
+                            ui,
+                            pal,
+                            tr(lang, "Border Radius", "Border Radius"),
+                            &mut self.style.corner_radius,
+                            0..=32,
+                            |v| format!("{v} px"),
+                        );
+                        changed |= slider_row(
+                            ui,
+                            pal,
+                            tr(lang, "Padding X", "Padding X"),
+                            &mut self.style.padding_x,
+                            4..=60,
+                            |v| format!("{v} px"),
+                        );
+                        changed |= slider_row(
+                            ui,
+                            pal,
+                            tr(lang, "Padding Y", "Padding Y"),
+                            &mut self.style.padding_y,
+                            2..=40,
+                            |v| format!("{v} px"),
+                        );
                         ui.horizontal(|ui| {
-                            ui.label(self.t("Opacity", "Opacity"));
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                let pct = ((self.style.opacity as f32 / 255.0) * 100.0).round()
-                                    as i32;
-                                ui.label(
-                                    RichText::new(format!("{}%", pct))
-                                        .font(FontId::new(12.0, FontFamily::Monospace))
-                                        .color(pal.text_muted),
-                                );
-                                if ui
-                                    .add(
-                                        egui::Slider::new(&mut self.style.opacity, 40..=255)
-                                            .show_value(false),
-                                    )
-                                    .changed()
-                                {
-                                    changed = true;
-                                }
-                            });
-                        });
-
-                        ui.horizontal(|ui| {
-                            ui.label(self.t("Border Radius", "Border Radius"));
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                ui.label(
-                                    RichText::new(format!("{} px", self.style.corner_radius))
-                                        .font(FontId::new(12.0, FontFamily::Monospace))
-                                        .color(pal.text_muted),
-                                );
-                                if ui
-                                    .add(
-                                        egui::Slider::new(&mut self.style.corner_radius, 0..=32)
-                                            .show_value(false),
-                                    )
-                                    .changed()
-                                {
-                                    changed = true;
-                                }
-                            });
-                        });
-                        ui.end_row();
-
-                        // Row 5: Padding X | Padding Y
-                        ui.horizontal(|ui| {
-                            ui.label(self.t("Padding X", "Padding X"));
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                ui.label(
-                                    RichText::new(format!("{} px", self.style.padding_x))
-                                        .font(FontId::new(12.0, FontFamily::Monospace))
-                                        .color(pal.text_muted),
-                                );
-                                if ui
-                                    .add(
-                                        egui::Slider::new(&mut self.style.padding_x, 4..=60)
-                                            .show_value(false),
-                                    )
-                                    .changed()
-                                {
-                                    changed = true;
-                                }
-                            });
-                        });
-
-                        ui.horizontal(|ui| {
-                            ui.label(self.t("Padding Y", "Padding Y"));
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                ui.label(
-                                    RichText::new(format!("{} px", self.style.padding_y))
-                                        .font(FontId::new(12.0, FontFamily::Monospace))
-                                        .color(pal.text_muted),
-                                );
-                                if ui
-                                    .add(
-                                        egui::Slider::new(&mut self.style.padding_y, 2..=40)
-                                            .show_value(false),
-                                    )
-                                    .changed()
-                                {
-                                    changed = true;
-                                }
-                            });
-                        });
-                        ui.end_row();
-
-                        // Row 6: Auto-Fit Container
-                        ui.horizontal(|ui| {
-                            if ui
+                            row_label(ui, "");
+                            changed |= ui
                                 .checkbox(
                                     &mut self.style.fit_to_text,
                                     tr(lang, "Auto-Fit Container", "Auto-Fit Container"),
                                 )
-                                .changed()
-                            {
-                                changed = true;
-                            }
+                                .changed();
                         });
-                        ui.label("");
-                        ui.end_row();
-                    });
+                    }
+                });
             });
 
         if changed {
-            self.handle.apply_style(self.style.clone(), true);
+            self.commit_style();
         }
     }
 
@@ -1255,12 +1398,9 @@ impl OvercapApp {
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
                     let btn = egui::Button::new(
-                        RichText::new(self.t(
-                            "Save & Reload Engine",
-                            "Kaydet ve Motoru Yenile",
-                        ))
-                        .color(pal.accent_text)
-                        .strong(),
+                        RichText::new(self.t("Save & Reload Engine", "Kaydet ve Motoru Yenile"))
+                            .color(pal.accent_text)
+                            .strong(),
                     )
                     .fill(pal.accent);
                     if ui.add(btn).clicked() {
@@ -1321,7 +1461,7 @@ impl OvercapApp {
 
                 ui.add_space(8.0);
 
-                if cfg.profiles.is_empty() {
+                if cfg.profiles.is_empty() && cfg.profile_styles.is_empty() {
                     ui.label(
                         RichText::new(self.t(
                             "No app profiles saved yet. Use Ctrl+Shift+S while focused on an app.",
@@ -1331,12 +1471,17 @@ impl OvercapApp {
                         .color(pal.text_muted),
                     );
                 } else {
-                    let mut entries: Vec<(String, crate::config::Region)> =
-                        cfg.profiles.into_iter().collect();
-                    entries.sort_by(|a, b| a.0.cmp(&b.0));
+                    let mut apps: Vec<String> = cfg
+                        .profiles
+                        .keys()
+                        .chain(cfg.profile_styles.keys())
+                        .cloned()
+                        .collect();
+                    apps.sort();
+                    apps.dedup();
 
                     egui::Grid::new("profiles_table")
-                        .num_columns(3)
+                        .num_columns(4)
                         .spacing([20.0, 6.0])
                         .show(ui, |ui| {
                             ui.label(
@@ -1349,21 +1494,40 @@ impl OvercapApp {
                                     .size(11.5)
                                     .color(pal.text_muted),
                             );
+                            ui.label(
+                                RichText::new(self.t("Style", "Stil"))
+                                    .size(11.5)
+                                    .color(pal.text_muted),
+                            );
                             ui.label("");
                             ui.end_row();
 
-                            for (app, reg) in entries {
+                            for app in apps {
                                 ui.label(
                                     RichText::new(&app)
                                         .font(FontId::new(12.0, FontFamily::Monospace)),
                                 );
-                                ui.label(
-                                    RichText::new(format!(
+                                let region_text = match cfg.profiles.get(&app) {
+                                    Some(reg) => format!(
                                         "{}x{} @ {},{}",
                                         reg.width, reg.height, reg.left, reg.top
-                                    ))
-                                    .font(FontId::new(12.0, FontFamily::Monospace))
-                                    .color(pal.text_muted),
+                                    ),
+                                    None => "-".to_string(),
+                                };
+                                ui.label(
+                                    RichText::new(region_text)
+                                        .font(FontId::new(12.0, FontFamily::Monospace))
+                                        .color(pal.text_muted),
+                                );
+                                let style_text = if cfg.profile_styles.contains_key(&app) {
+                                    self.t("custom", "ozel")
+                                } else {
+                                    "-"
+                                };
+                                ui.label(
+                                    RichText::new(style_text)
+                                        .font(FontId::new(12.0, FontFamily::Monospace))
+                                        .color(pal.text_muted),
                                 );
                                 if ui.button(self.t("Remove", "Kaldir")).clicked() {
                                     let _ = self.handle.delete_profile(&app);
@@ -1456,14 +1620,151 @@ impl OvercapApp {
                     // Muted red left-border indicator
                     let r = resp.response.rect;
                     ui.painter().line_segment(
-                        [egui::pos2(r.left() + 1.5, r.top() + 2.0), egui::pos2(r.left() + 1.5, r.bottom() - 2.0)],
+                        [
+                            egui::pos2(r.left() + 1.5, r.top() + 2.0),
+                            egui::pos2(r.left() + 1.5, r.bottom() - 2.0),
+                        ],
                         Stroke::new(3.0_f32, pal.status_red),
                     );
                 }
             });
     }
 
+    /// Shows the newest undismissed notice (config reset, engine fallback, ...) under the top bar.
+    fn render_notice_banner(&mut self, ctx: &egui::Context, pal: Palette) {
+        let Some(notice) = self
+            .handle
+            .recent_notices()
+            .into_iter()
+            .last()
+            .filter(|n| n.id > self.dismissed_notice_id)
+        else {
+            return;
+        };
+
+        let color = notice_color(pal, notice.level);
+        let level_label = match notice.level {
+            NoticeLevel::Warning => self.t("Warning", "Uyari"),
+            NoticeLevel::Error => self.t("Error", "Hata"),
+        };
+        let dismiss_label = self.t("Dismiss", "Kapat");
+        let mut head = format!(
+            "{} | {} | {}",
+            level_label,
+            notice.source.to_uppercase(),
+            notice.timestamp
+        );
+        if notice.count > 1 {
+            head.push_str(&format!(" | x{}", notice.count));
+        }
+
+        let mut dismissed = false;
+        egui::TopBottomPanel::top("notice_banner")
+            .frame(
+                Frame::none()
+                    .fill(pal.window_bg)
+                    .inner_margin(Margin::symmetric(14.0, 0.0)),
+            )
+            .show(ctx, |ui| {
+                Frame::none()
+                    .fill(pal.surface_bg)
+                    .stroke(Stroke::new(1.0_f32, color))
+                    .rounding(Rounding::same(4.0))
+                    .inner_margin(Margin::symmetric(12.0, 8.0))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            let (dot_rect, _) =
+                                ui.allocate_exact_size(Vec2::splat(8.0), Sense::hover());
+                            ui.painter().circle_filled(dot_rect.center(), 4.0, color);
+                            ui.label(
+                                RichText::new(head)
+                                    .font(FontId::new(11.5, FontFamily::Monospace))
+                                    .color(pal.text_muted),
+                            );
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if ui.button(dismiss_label).clicked() {
+                                    dismissed = true;
+                                }
+                            });
+                        });
+                        ui.add_space(2.0);
+                        ui.label(
+                            RichText::new(&notice.message)
+                                .font(FontId::new(12.0, FontFamily::Monospace))
+                                .color(pal.text_primary),
+                        );
+                    });
+                ui.add_space(6.0);
+            });
+
+        if dismissed {
+            self.dismissed_notice_id = notice.id;
+        }
+    }
+
+    fn render_events_section(&mut self, ui: &mut egui::Ui, pal: Palette) {
+        let notices = self.handle.recent_notices();
+        if notices.is_empty() {
+            return;
+        }
+
+        Frame::none()
+            .fill(pal.surface_bg)
+            .stroke(Stroke::new(1.0_f32, pal.border))
+            .rounding(Rounding::same(4.0))
+            .inner_margin(Margin::symmetric(12.0, 10.0))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(format!(
+                            "{} ({})",
+                            self.t("Events", "Olaylar"),
+                            notices.len()
+                        ))
+                        .strong()
+                        .size(13.0)
+                        .color(pal.text_primary),
+                    );
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui.button(self.t("Clear", "Temizle")).clicked() {
+                            self.handle.clear_notices();
+                        }
+                    });
+                });
+
+                ui.add_space(6.0);
+
+                ScrollArea::vertical()
+                    .max_height(120.0)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        for n in notices.iter().rev() {
+                            let level = match n.level {
+                                NoticeLevel::Warning => "WARN",
+                                NoticeLevel::Error => "ERROR",
+                            };
+                            let times = if n.count > 1 {
+                                format!(" (x{})", n.count)
+                            } else {
+                                String::new()
+                            };
+                            ui.label(
+                                RichText::new(format!(
+                                    "{} [{} | {}] {}{}",
+                                    n.timestamp, level, n.source, n.message, times
+                                ))
+                                .font(FontId::new(11.5, FontFamily::Monospace))
+                                .color(notice_color(pal, n.level)),
+                            );
+                        }
+                    });
+            });
+
+        ui.add_space(8.0);
+    }
+
     fn render_live_log_tab(&mut self, ui: &mut egui::Ui, pal: Palette) {
+        self.render_events_section(ui, pal);
         let logs = self.handle.recent_logs();
 
         Frame::none()
@@ -1498,10 +1799,12 @@ impl OvercapApp {
                     .show(ui, |ui| {
                         if logs.is_empty() {
                             ui.label(
-                                RichText::new(self.t(
-                                    "No translations recorded yet.",
-                                    "Henuz ceviri kaydi yok.",
-                                ))
+                                RichText::new(
+                                    self.t(
+                                        "No translations recorded yet.",
+                                        "Henuz ceviri kaydi yok.",
+                                    ),
+                                )
                                 .font(FontId::new(12.0, FontFamily::Monospace))
                                 .color(pal.text_muted),
                             );
@@ -1542,11 +1845,7 @@ impl eframe::App for OvercapApp {
             return;
         }
 
-        if self
-            .handle
-            .gui_open_requested
-            .swap(false, Ordering::SeqCst)
-        {
+        if self.handle.gui_open_requested.swap(false, Ordering::SeqCst) {
             ctx.send_viewport_cmd(ViewportCommand::Visible(true));
             ctx.send_viewport_cmd(ViewportCommand::Focus);
         }
@@ -1564,6 +1863,8 @@ impl eframe::App for OvercapApp {
             .show(ctx, |ui| {
                 self.render_top_bar(ui, pal);
             });
+
+        self.render_notice_banner(ctx, pal);
 
         egui::TopBottomPanel::bottom("status_bar")
             .exact_height(24.0)
@@ -1612,8 +1913,10 @@ pub fn run_gui(handle: OverlayHandle, start_hidden: bool) -> Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Overcap")
-            .with_inner_size([760.0, 620.0])
-            .with_min_inner_size([680.0, 540.0])
+            // Fixed size: the layout is designed for exactly this window.
+            .with_inner_size([900.0, 720.0])
+            .with_resizable(false)
+            .with_maximize_button(false)
             .with_visible(!start_hidden)
             .with_icon(Arc::new(egui::IconData {
                 rgba: tray::generate_icon_rgba(32),
