@@ -16,6 +16,11 @@ The canonical version number is maintained in `package.version` inside [Cargo.to
 
 ## Changelog
 
+### `v0.4.5` — Stream Mode (Windows Graphics Capture)
+- Added optional **Stream Mode (Discord / OBS)** in `Profiles & OCR` (`stream_mode` in `config.json`, default `false`).
+- Implemented GPU window capture in `src/wgc.rs` using Windows Graphics Capture (`GraphicsCaptureItem::CreateForWindow`, `Direct3D11CaptureFramePool::CreateFreeThreaded`, `IsBorderRequired(false)` on Windows 11) so only the target game/app window is captured.
+- When Stream Mode is enabled, the overlay switches its display affinity from `WDA_EXCLUDEFROMCAPTURE` to `WDA_NONE` live without restarting, allowing Discord/OBS screen share (Screen capture) to display translated subtitles without causing OCR self-capture loops.
+
 ### `v0.4.4` — In-Game Translation History
 - `Ctrl+Shift+L`, son 15 hedef çeviriyi gösteren, oyundan odak almayan yerel geçmiş panelini açar/kapatır. Live Log ekranında da aç/kapat düğmesi bulunur.
 - Geçmiş eskiden yeniye sıralanır; fare tekerleği veya panel açıkken `Ctrl+Shift+PageUp/PageDown` ile kaydırılır. Yeni sonuçlar gelirken eski replikleri okuma konumu korunur.

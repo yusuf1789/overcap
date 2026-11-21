@@ -136,6 +136,9 @@ pub struct AppConfig {
     /// Per-app subtitle look, keyed like `profiles` (lowercase `.exe` name).
     #[serde(default)]
     pub profile_styles: HashMap<String, OverlayStyle>,
+    /// Capture the target window via WGC and allow the overlay to appear in Discord/OBS screen share.
+    #[serde(default)]
+    pub stream_mode: bool,
 }
 
 fn default_font_family() -> String {
@@ -252,6 +255,7 @@ impl Default for AppConfig {
             auto_profiles: default_auto_profiles(),
             profiles: HashMap::new(),
             profile_styles: HashMap::new(),
+            stream_mode: false,
         }
     }
 }

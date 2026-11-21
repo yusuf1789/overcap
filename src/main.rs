@@ -12,6 +12,7 @@ mod render;
 mod selector;
 mod translator;
 mod tray;
+mod wgc;
 
 use anyhow::Result;
 use clap::Parser;
@@ -493,6 +494,8 @@ fn ocr_worker(
     let mut empty_streak: u32 = 0;
     let mut last_profile_check = Instant::now() - Duration::from_secs(1);
     let mut last_fg_app: Option<String> = None;
+    let mut last_target_hwnd: Option<windows::Win32::Foundation::HWND> = None;
+    let mut wgc_capturer: Option<wgc::WindowCapturer> = None;
     let mut last_revision = handle.engine_revision.load(Ordering::SeqCst);
     let mut diagnostics = diagnostics::OcrDiagnostics::new(handle.clone());
 
@@ -525,7 +528,11 @@ fn ocr_worker(
                 }
             }
 
-            let fg_app = profiles::foreground_process_name();
+            let fg_target = profiles::foreground_target_window();
+            if let Some((hwnd, _)) = fg_target {
+                last_target_hwnd = Some(hwnd);
+            }
+            let fg_app = fg_target.map(|(_, name)| name);
             if fg_app != last_fg_app {
                 last_fg_app = fg_app.clone();
                 handle.set_active_app(fg_app.clone());
@@ -576,17 +583,71 @@ fn ocr_worker(
         }
         let t0 = Instant::now();
 
-        let frame = match capture_region(region) {
-            Ok(f) => f,
-            Err(e) => {
-                eprintln!("[Capture ERROR] {e}");
-                handle.push_notice(
-                    NoticeLevel::Error,
-                    "capture",
-                    format!("Screen capture failed: {e}"),
-                );
-                thread::sleep(Duration::from_millis(300));
+        let frame = if handle.is_stream_mode() {
+            if wgc_capturer.is_none() {
+                match wgc::WindowCapturer::new() {
+                    Ok(cap) => wgc_capturer = Some(cap),
+                    Err(e) => {
+                        eprintln!("[WGC ERROR] {e}");
+                        handle.push_notice(
+                            NoticeLevel::Error,
+                            "capture",
+                            format!("Stream Mode (WGC) unavailable: {e}. Reverted to normal capture."),
+                        );
+                        handle.set_stream_mode(false);
+                        thread::sleep(Duration::from_millis(250));
+                        continue;
+                    }
+                }
+            }
+
+            let target_hwnd = profiles::foreground_target_window()
+                .map(|(h, _)| {
+                    last_target_hwnd = Some(h);
+                    h
+                })
+                .or(last_target_hwnd);
+
+            let Some(hwnd) = target_hwnd else {
+                thread::sleep(sleep_dur);
                 continue;
+            };
+
+            match wgc_capturer
+                .as_mut()
+                .unwrap()
+                .capture_window_region(hwnd, region)
+            {
+                Ok(Some(f)) => f,
+                Ok(None) => {
+                    thread::sleep(sleep_dur);
+                    continue;
+                }
+                Err(e) => {
+                    eprintln!("[WGC ERROR] {e}");
+                    if let Some(cap) = wgc_capturer.as_mut() {
+                        cap.reset();
+                    }
+                    thread::sleep(Duration::from_millis(250));
+                    continue;
+                }
+            }
+        } else {
+            if wgc_capturer.is_some() {
+                wgc_capturer = None;
+            }
+            match capture_region(region) {
+                Ok(f) => f,
+                Err(e) => {
+                    eprintln!("[Capture ERROR] {e}");
+                    handle.push_notice(
+                        NoticeLevel::Error,
+                        "capture",
+                        format!("Screen capture failed: {e}"),
+                    );
+                    thread::sleep(Duration::from_millis(300));
+                    continue;
+                }
             }
         };
 

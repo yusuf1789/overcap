@@ -1506,6 +1506,45 @@ impl OvercapApp {
             .inner_margin(Margin::symmetric(12.0, 10.0))
             .show(ui, |ui| {
                 ui.label(
+                    RichText::new("Stream Mode (Discord / OBS)")
+                        .strong()
+                        .size(13.0)
+                        .color(pal.text_primary),
+                );
+                ui.add_space(6.0);
+                let mut stream_mode = cfg.stream_mode;
+                if ui
+                    .checkbox(
+                        &mut stream_mode,
+                        self.t(
+                            "Enable Stream Mode (WGC Window Capture)",
+                            "Stream Mode Acik (WGC Pencere Yakalama)",
+                        ),
+                    )
+                    .changed()
+                {
+                    self.handle.set_stream_mode(stream_mode);
+                }
+                ui.add_space(3.0);
+                ui.label(
+                    RichText::new(self.t(
+                        "Captures the target window directly via GPU (WGC) and makes the overlay visible in Discord/OBS screen share (share Screen, not Application).",
+                        "Hedef pencereyi dogrudan GPU'dan (WGC) yakalar ve altyaziyi Discord/OBS ekran paylasiminda gorunur yapar (Uygulama degil Ekran paylasin).",
+                    ))
+                    .size(11.5)
+                    .color(pal.text_muted),
+                );
+            });
+
+        ui.add_space(10.0);
+
+        Frame::none()
+            .fill(pal.surface_bg)
+            .stroke(Stroke::new(1.0_f32, pal.border))
+            .rounding(Rounding::same(4.0))
+            .inner_margin(Margin::symmetric(12.0, 10.0))
+            .show(ui, |ui| {
+                ui.label(
                     RichText::new(self.t("App Profiles", "App Profiles"))
                         .strong()
                         .size(13.0)

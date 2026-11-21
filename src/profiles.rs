@@ -1,15 +1,14 @@
 use windows::core::PWSTR;
-use windows::Win32::Foundation::CloseHandle;
+use windows::Win32::Foundation::{CloseHandle, HWND};
 use windows::Win32::System::Threading::{
     OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
     PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
 
-/// Returns the lowercase executable filename (e.g. `"tlou-ii.exe"`, `"chrome.exe"`)
-/// of the current foreground window's process, or `None` on failure or if the
-/// foreground window belongs to `overcap.exe` itself.
-pub fn foreground_process_name() -> Option<String> {
+/// Returns the foreground window handle and its lowercase executable filename
+/// (e.g. `(hwnd, "tlou-ii.exe")`), or `None` on failure or if it belongs to `overcap.exe`.
+pub fn foreground_target_window() -> Option<(HWND, String)> {
     unsafe {
         let hwnd = GetForegroundWindow();
         if hwnd.0.is_null() {
@@ -49,6 +48,13 @@ pub fn foreground_process_name() -> Option<String> {
             return None;
         }
 
-        Some(exe_name)
+        Some((hwnd, exe_name))
     }
+}
+
+/// Returns the lowercase executable filename (e.g. `"tlou-ii.exe"`, `"chrome.exe"`)
+/// of the current foreground window's process, or `None` on failure or if the
+/// foreground window belongs to `overcap.exe` itself.
+pub fn foreground_process_name() -> Option<String> {
+    foreground_target_window().map(|(_, name)| name)
 }

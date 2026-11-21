@@ -15,9 +15,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetSystemMetrics, PostMessageW, PostQuitMessage, RegisterClassW, SetWindowDisplayAffinity,
     SetWindowPos, ShowWindow, TranslateMessage, CS_HREDRAW, CS_VREDRAW, HICON, HWND_TOPMOST, MSG,
     SM_CXSCREEN, SM_CYSCREEN, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SW_HIDE,
-    WDA_EXCLUDEFROMCAPTURE, WM_APP, WM_DESTROY, WM_ERASEBKGND, WM_HOTKEY, WM_LBUTTONDBLCLK,
-    WM_LBUTTONUP, WM_PAINT, WM_RBUTTONUP, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+    WDA_EXCLUDEFROMCAPTURE, WDA_NONE, WM_APP, WM_DESTROY, WM_ERASEBKGND, WM_HOTKEY,
+    WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_PAINT, WM_RBUTTONUP, WNDCLASSW, WS_EX_LAYERED,
+    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
 
 use crate::config::{AppConfig, OverlayStyle, Region, MAX_OUTLINE_WIDTH};
@@ -34,6 +34,7 @@ const WM_APP_TOGGLE_PAUSE: u32 = WM_APP + 4;
 const WM_APP_QUIT: u32 = WM_APP + 5;
 const WM_APP_HISTORY_TOGGLE: u32 = WM_APP + 6;
 const WM_APP_HISTORY_REFRESH: u32 = WM_APP + 7;
+const WM_APP_STREAM_MODE: u32 = WM_APP + 8;
 
 const MAX_LOG_ENTRIES: usize = 100;
 const MAX_NOTICES: usize = 50;
@@ -256,6 +257,30 @@ impl OverlayHandle {
 
     pub fn is_paused(&self) -> bool {
         self.state.lock().map(|s| s.paused).unwrap_or(false)
+    }
+
+    pub fn is_stream_mode(&self) -> bool {
+        self.state
+            .lock()
+            .map(|s| s.config.stream_mode)
+            .unwrap_or(false)
+    }
+
+    pub fn set_stream_mode(&self, enabled: bool) {
+        let save_result = if let Ok(mut st) = self.state.lock() {
+            st.config.stream_mode = enabled;
+            st.config.save()
+        } else {
+            Ok(())
+        };
+        if let Err(e) = save_result {
+            self.push_notice(
+                NoticeLevel::Error,
+                "config",
+                format!("Failed to save stream_mode: {e}"),
+            );
+        }
+        self.post_msg(WM_APP_STREAM_MODE);
     }
 
     pub fn snapshot_config(&self) -> AppConfig {
@@ -782,6 +807,20 @@ unsafe extern "system" fn overlay_wnd_proc(
             crate::history::refresh();
             LRESULT(0)
         }
+        WM_APP_STREAM_MODE => {
+            let stream_mode = OVERLAY_HANDLE
+                .lock()
+                .ok()
+                .and_then(|g| g.as_ref().map(|h| h.is_stream_mode()))
+                .unwrap_or(false);
+            let affinity = if stream_mode {
+                WDA_NONE
+            } else {
+                WDA_EXCLUDEFROMCAPTURE
+            };
+            let _ = SetWindowDisplayAffinity(hwnd, affinity);
+            LRESULT(0)
+        }
         WM_APP_QUIT => {
             handle_quit(hwnd);
             LRESULT(0)
@@ -961,9 +1000,15 @@ pub fn run_overlay_loop(handle: OverlayHandle) -> Result<()> {
             *raw = hwnd.0 as isize;
         }
 
-        // CRITICAL: Exclude this overlay window from screen capture so OCR always sees
-        // the underlying original subtitle underneath our translated overlay.
-        SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE)?;
+        // Exclude this overlay window from screen capture in normal mode so OCR always sees
+        // the underlying original subtitle. In Stream Mode (WGC window capture), WDA_NONE allows
+        // Discord/OBS screen share to see the translated overlay.
+        let initial_affinity = if handle.is_stream_mode() {
+            WDA_NONE
+        } else {
+            WDA_EXCLUDEFROMCAPTURE
+        };
+        SetWindowDisplayAffinity(hwnd, initial_affinity)?;
         // Do NOT call SetLayeredWindowAttributes on this window: once it has been used,
         // UpdateLayeredWindow (per-pixel alpha, see render.rs) fails for the window's lifetime.
 
