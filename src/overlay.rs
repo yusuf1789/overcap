@@ -365,12 +365,15 @@ impl OverlayHandle {
 
     /// Saves `cfg` and reports a failure as a notice instead of dropping it.
     pub fn save_config_or_notice(&self, cfg: &AppConfig) {
-        if let Err(e) = cfg.save() {
+        let path = AppConfig::path();
+        if let Err(e) = cfg.save_to(&path) {
             self.push_notice(
                 NoticeLevel::Error,
                 "config",
-                format!("Could not save config.json: {e}"),
+                format!("Could not save {}: {e}", path.display()),
             );
+        } else {
+            println!("[Config] Saved {}", path.display());
         }
     }
 
@@ -569,33 +572,60 @@ fn handle_reselect(hwnd: HWND) {
     unsafe {
         let _ = ShowWindow(hwnd, SW_HIDE);
     }
-    if let Ok(Some(new_region)) = select_region() {
-        println!("[Region] New region: {:?}", new_region);
-        if let Ok(guard) = OVERLAY_HANDLE.lock() {
-            if let Some(h) = guard.as_ref() {
-                if let Ok(mut st) = h.state.lock() {
-                    st.region = new_region;
-                    st.config.region = Some(new_region);
-                    if let Some(ref app) = detected_app {
-                        st.active_app = Some(app.clone());
-                        st.config.profiles.insert(app.clone(), new_region);
-                        println!("[Profile] Saved region for {}", app);
+
+    match select_region() {
+        Ok(Some(new_region)) => {
+            println!("[Region] New region: {:?}", new_region);
+            match OVERLAY_HANDLE.lock() {
+                Ok(guard) => match guard.as_ref() {
+                    Some(h) => match h.state.lock() {
+                        Ok(mut st) => {
+                            st.region = new_region;
+                            st.config.region = Some(new_region);
+                            if let Some(ref app) = detected_app {
+                                st.active_app = Some(app.clone());
+                                st.config.profiles.insert(app.clone(), new_region);
+                                println!("[Profile] Saved region for {}", app);
+                            }
+                            h.save_config_or_notice(&st.config);
+                            h.region_changed.store(true, Ordering::SeqCst);
+                        }
+                        Err(e) => h.push_notice(
+                            NoticeLevel::Error,
+                            "region",
+                            format!("Could not update region because overlay state is locked: {e}"),
+                        ),
+                    },
+                    None => {
+                        eprintln!("[Region ERROR] Overlay handle is unavailable after selection")
                     }
-                    h.save_config_or_notice(&st.config);
-                }
-                h.region_changed.store(true, Ordering::SeqCst);
+                },
+                Err(e) => eprintln!("[Region ERROR] Could not access overlay handle: {e}"),
+            }
+            unsafe {
+                let _ = SetWindowPos(
+                    hwnd,
+                    HWND_TOPMOST,
+                    new_region.left,
+                    new_region.top,
+                    new_region.width,
+                    new_region.height,
+                    SWP_NOACTIVATE,
+                );
             }
         }
-        unsafe {
-            let _ = SetWindowPos(
-                hwnd,
-                HWND_TOPMOST,
-                new_region.left,
-                new_region.top,
-                new_region.width,
-                new_region.height,
-                SWP_NOACTIVATE,
-            );
+        Ok(None) => println!("[Region] Selection cancelled or too small; config unchanged"),
+        Err(e) => {
+            eprintln!("[Region ERROR] Selector failed: {e}");
+            if let Ok(guard) = OVERLAY_HANDLE.lock() {
+                if let Some(h) = guard.as_ref() {
+                    h.push_notice(
+                        NoticeLevel::Error,
+                        "region",
+                        format!("Region selector failed: {e}"),
+                    );
+                }
+            }
         }
     }
     apply_visibility_and_redraw(hwnd);

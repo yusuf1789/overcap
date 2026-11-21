@@ -14,12 +14,12 @@ It captures a user-selected screen rectangle via GDI `BitBlt`, extracts text and
 - `src/ocr.rs` — `Windows.Media.Ocr` (`WinOcr`) wrapper, Y/X line ordering, and screen-pixel `SourceBounds` calculation.
 - `src/translator.rs` — `Translator` trait, `GroqTranslator`, `GeminiTranslator`, `OpenAiCompatTranslator`, `GoogleTranslator`, translation cache, and Levenshtein + word-overlap deduplication (`is_same_subtitle`).
 - `src/render.rs` — Software compositing of the overlay bitmap (premultiplied BGRA): background box with its own opacity and anti-aliased rounded corners, shadow, text outline, and opaque text from a GDI grayscale coverage mask; `UpdateLayeredWindow` presenter. Pure parts are unit-tested.
-- `src/overlay.rs` — Win32 layered/click-through overlay window, `WDA_EXCLUDEFROMCAPTURE`, per-app style switching, dynamic `Auto-Fit` + `SourceBounds` coverage, global hotkeys, tray message dispatch, and the user-visible `Notice` channel (`push_notice`; release builds have no console, so report errors there instead of only `eprintln!`).
+- `src/overlay.rs` — Win32 layered/click-through overlay window, `WDA_EXCLUDEFROMCAPTURE`, per-app style switching, dynamic `Auto-Fit` + `SourceBounds` coverage, global hotkeys, tray message dispatch, config-path/save diagnostics for region reselection, and the user-visible `Notice` channel (`push_notice`; release builds have no console, so report errors there instead of only `eprintln!`).
 - `src/selector.rs` — Multi-monitor-aware fullscreen Win32 region selector.
 - `src/gui.rs` — Native `eframe`/`egui` desktop control center (Appearance, Engine, Profiles & OCR, Live Log), live preview strip, notice banner + `Events` list, `EN`/`TR` toggle, Dark/Light neutral themes, and minimize-to-tray lifecycle.
 - `src/tray.rs` — Native Win32 System Tray icon (`Shell_NotifyIconW`), procedural RGBA/HICON generator, and right-click context menu.
 - `src/profiles.rs` — Foreground process `.exe` detection for automatic per-app subtitle region profiles.
-- `src/config.rs` — `AppConfig` and `OverlayStyle` (global style + per-app `profile_styles`) serialization (`config.json`), backward-compatible `#[serde(default)]` fields, and hex-to-COLORREF parser.
+- `src/config.rs` — `AppConfig` and `OverlayStyle` (global style + per-app `profile_styles`) serialization (`config.json`), exe-vs-working-directory config resolution (with duplicate-path reporting), backward-compatible `#[serde(default)]` fields, and hex-to-COLORREF parser.
 
 ## Architectural Principles & Constraints
 

@@ -599,6 +599,18 @@ fn main() -> Result<()> {
     if let Some(msg) = config_notice {
         startup_notices.push((NoticeLevel::Warning, "config", msg));
     }
+    if let Some(ignored) = AppConfig::ignored_path() {
+        startup_notices.push((
+            NoticeLevel::Warning,
+            "config",
+            format!(
+                "Two config.json files exist. Using {} and ignoring {}. Keys and settings in the \
+                 ignored file have no effect; merge them or delete one.",
+                AppConfig::path().display(),
+                ignored.display()
+            ),
+        ));
+    }
 
     let mut cfg_dirty = false;
     if let Some(engine) = args.engine {

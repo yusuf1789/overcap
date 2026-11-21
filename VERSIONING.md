@@ -16,6 +16,10 @@ The canonical version number is maintained in `package.version` inside [Cargo.to
 
 ## Changelog
 
+### `v0.4.2` — Config Path & Region Save Diagnostics
+- A warning banner now appears when two `config.json` files exist (one next to the exe wins, the one in the working directory is ignored), naming both paths. Launching the exe directly with no config nearby creates a fresh default one, which then shadows a project-root config.
+- Region reselection now reports selector failures and logs the exact config path used for saves; config save errors include that path instead of being silently ambiguous.
+
 ### `v0.4.1` — Subtitle Look: Background-Only Opacity, Outline & Per-App Styles
 - **Behavior change:** `opacity` now applies to the background box only. The overlay is drawn with per-pixel alpha (`UpdateLayeredWindow`) instead of one window-wide alpha, so text is always fully opaque. Existing `opacity` values keep working but the text is now sharper than before at the same setting; the slider range is `0..=255` (was `40..=255`). Text is rendered with grayscale instead of ClearType antialiasing, which is required for transparency. Rounded corners are anti-aliased in the bitmap instead of a window region.
 - Added a text outline (`outline_width` 0-6 px, `outline_color`); default width `0` keeps existing looks. The drop shadow now follows the outline shape. `Yellow` and `High Contrast` presets use a thin outline.

@@ -262,22 +262,25 @@ impl AppConfig {
     /// 2. Fall back to `config.json` in the current working directory if it exists (dev/launcher compatibility).
     /// 3. Otherwise default to the executable's directory so portable installs stay self-contained.
     pub fn path() -> PathBuf {
+        Self::resolve_paths().0
+    }
+
+    /// A second `config.json` that exists but is NOT being used (it lives in the working
+    /// directory while the one next to the exe wins). Settings and API keys in it are silently
+    /// ignored, so the caller should tell the user.
+    pub fn ignored_path() -> Option<PathBuf> {
+        Self::resolve_paths().1
+    }
+
+    /// Returns `(used, ignored)`, see `path` and `ignored_path`.
+    fn resolve_paths() -> (PathBuf, Option<PathBuf>) {
         let exe_cfg = std::env::current_exe()
             .ok()
             .and_then(|p| p.parent().map(|d| d.join("config.json")));
-
-        if let Some(ref p) = exe_cfg {
-            if p.exists() {
-                return p.clone();
-            }
-        }
-
-        let cwd_cfg = PathBuf::from("config.json");
-        if cwd_cfg.exists() {
-            return cwd_cfg;
-        }
-
-        exe_cfg.unwrap_or(cwd_cfg)
+        let cwd_cfg = std::env::current_dir()
+            .map(|d| d.join("config.json"))
+            .unwrap_or_else(|_| PathBuf::from("config.json"));
+        pick_config(exe_cfg, cwd_cfg)
     }
 
     /// The style to use while `app` is in the foreground: its own style if per-app switching
@@ -374,6 +377,27 @@ impl AppConfig {
         }
         Ok(())
     }
+}
+
+fn same_file(a: &Path, b: &Path) -> bool {
+    match (fs::canonicalize(a), fs::canonicalize(b)) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => false,
+    }
+}
+
+/// Chooses the config file: the one next to the exe if it exists, else the one in the working
+/// directory if it exists, else a new one next to the exe. The second value is a config file
+/// that exists but loses to the first.
+fn pick_config(exe_cfg: Option<PathBuf>, cwd_cfg: PathBuf) -> (PathBuf, Option<PathBuf>) {
+    if let Some(used) = exe_cfg.as_ref().filter(|p| p.exists()) {
+        let ignored = (cwd_cfg.exists() && !same_file(used, &cwd_cfg)).then_some(cwd_cfg);
+        return (used.clone(), ignored);
+    }
+    if cwd_cfg.exists() {
+        return (cwd_cfg, None);
+    }
+    (exe_cfg.unwrap_or(cwd_cfg), None)
 }
 
 /// `config.json` + `.bak` -> `config.json.bak` (appends instead of replacing the extension).
@@ -541,6 +565,44 @@ mod tests {
         assert_eq!(cfg.font_size, 50);
         assert_eq!(cfg.outline_width, 2);
         assert_eq!(OverlayStyle::from_config(&cfg), style);
+    }
+
+    #[test]
+    fn pick_config_reports_the_config_it_ignores() {
+        let dir = temp_dir("pick");
+        let exe_dir = dir.join("exe");
+        let cwd_dir = dir.join("cwd");
+        fs::create_dir_all(&exe_dir).unwrap();
+        fs::create_dir_all(&cwd_dir).unwrap();
+        let exe_cfg = exe_dir.join("config.json");
+        let cwd_cfg = cwd_dir.join("config.json");
+
+        // Neither exists: a new file next to the exe, nothing ignored.
+        assert_eq!(
+            pick_config(Some(exe_cfg.clone()), cwd_cfg.clone()),
+            (exe_cfg.clone(), None)
+        );
+
+        // Only the working-directory one exists: use it.
+        fs::write(&cwd_cfg, "{}").unwrap();
+        assert_eq!(
+            pick_config(Some(exe_cfg.clone()), cwd_cfg.clone()),
+            (cwd_cfg.clone(), None)
+        );
+
+        // Both exist: the exe one wins and the other is reported.
+        fs::write(&exe_cfg, "{}").unwrap();
+        assert_eq!(
+            pick_config(Some(exe_cfg.clone()), cwd_cfg.clone()),
+            (exe_cfg.clone(), Some(cwd_cfg.clone()))
+        );
+
+        // Same file reached twice (cwd == exe dir): not a duplicate.
+        assert_eq!(
+            pick_config(Some(exe_cfg.clone()), exe_cfg.clone()),
+            (exe_cfg, None)
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
