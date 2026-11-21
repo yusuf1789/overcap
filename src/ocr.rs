@@ -196,3 +196,44 @@ pub fn is_language_installed(lang_hint: &str) -> bool {
         lower == hint || lower.starts_with(&prefix)
     })
 }
+
+/// Maps a short or BCP-47 language code to its official Windows OCR capability name
+/// for `Add-WindowsCapability -Online -Name ...`.
+pub fn ocr_capability_name(lang_hint: &str) -> Option<&'static str> {
+    match lang_hint.trim().to_lowercase().as_str() {
+        "en" | "en-us" => Some("Language.OCR~~~en-US~0.0.1.0"),
+        "en-gb" => Some("Language.OCR~~~en-GB~0.0.1.0"),
+        "tr" | "tr-tr" => Some("Language.OCR~~~tr-TR~0.0.1.0"),
+        "de" | "de-de" => Some("Language.OCR~~~de-DE~0.0.1.0"),
+        "fr" | "fr-fr" => Some("Language.OCR~~~fr-FR~0.0.1.0"),
+        "es" | "es-es" => Some("Language.OCR~~~es-ES~0.0.1.0"),
+        "it" | "it-it" => Some("Language.OCR~~~it-IT~0.0.1.0"),
+        "pt" | "pt-br" => Some("Language.OCR~~~pt-BR~0.0.1.0"),
+        "ru" | "ru-ru" => Some("Language.OCR~~~ru-RU~0.0.1.0"),
+        "pl" | "pl-pl" => Some("Language.OCR~~~pl-PL~0.0.1.0"),
+        "ja" | "ja-jp" => Some("Language.OCR~~~ja-JP~0.0.1.0"),
+        "ko" | "ko-kr" => Some("Language.OCR~~~ko-KR~0.0.1.0"),
+        "zh" | "zh-cn" | "zh-hans" => Some("Language.OCR~~~zh-CN~0.0.1.0"),
+        _ => None,
+    }
+}
+
+/// Launches an elevated PowerShell window to install a Windows OCR language pack.
+/// Uses the official `Add-WindowsCapability` cmdlet so Windows prompts via UAC and
+/// shows install progress transparently.
+pub fn launch_ocr_pack_installer(capability: &str) -> std::io::Result<()> {
+    let inner = format!(
+        "Write-Host 'Installing Windows OCR pack: {capability}'; \
+         Add-WindowsCapability -Online -Name '{capability}'; \
+         Write-Host ''; \
+         Write-Host 'Done. You can close this window and click Recheck in Overcap.'"
+    );
+    let ps_cmd = format!(
+        "Start-Process powershell -Verb RunAs -ArgumentList '-NoExit', '-Command', \"{}\"",
+        inner
+    );
+    std::process::Command::new("powershell")
+        .args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", &ps_cmd])
+        .spawn()?;
+    Ok(())
+}

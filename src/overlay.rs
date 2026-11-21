@@ -20,11 +20,11 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
 
-use crate::config::{AppConfig, OverlayStyle, Region, MAX_OUTLINE_WIDTH};
+use crate::config::{AppConfig, OutputMode, OverlayStyle, Region, MAX_OUTLINE_WIDTH};
 use crate::ocr::SourceBounds;
 use crate::profiles::foreground_process_name;
 use crate::render::{measure_text_size, present, render_overlay};
-use crate::selector::select_region;
+use crate::selector::{select_region_with_options, SelectorOptions, OUTPUT_BORDER_COLORREF};
 use crate::tray::{self, TrayAction, WM_APP_TRAY};
 
 const WM_APP_UPDATE: u32 = WM_APP + 1;
@@ -35,6 +35,7 @@ const WM_APP_QUIT: u32 = WM_APP + 5;
 const WM_APP_HISTORY_TOGGLE: u32 = WM_APP + 6;
 const WM_APP_HISTORY_REFRESH: u32 = WM_APP + 7;
 const WM_APP_STREAM_MODE: u32 = WM_APP + 8;
+const WM_APP_SELECT_OUTPUT: u32 = WM_APP + 9;
 
 const MAX_LOG_ENTRIES: usize = 100;
 const MAX_NOTICES: usize = 50;
@@ -124,6 +125,7 @@ pub struct OverlayHandle {
     pub history: Arc<Mutex<crate::history::HistoryBuffer>>,
     pub history_visible: Arc<AtomicBool>,
     pub history_turkish: Arc<AtomicBool>,
+    pending_output_target_app: Arc<Mutex<Option<String>>>,
     notices: Arc<Mutex<VecDeque<Notice>>>,
     next_notice_id: Arc<AtomicU64>,
 }
@@ -529,6 +531,13 @@ impl OverlayHandle {
         self.post_msg(WM_APP_RESELECT);
     }
 
+    pub fn trigger_select_output(&self, for_app: Option<String>) {
+        if let Ok(mut target) = self.pending_output_target_app.lock() {
+            *target = for_app;
+        }
+        self.post_msg(WM_APP_SELECT_OUTPUT);
+    }
+
     pub fn toggle_pause(&self) {
         self.post_msg(WM_APP_TOGGLE_PAUSE);
     }
@@ -607,44 +616,69 @@ fn apply_visibility_and_redraw(hwnd: HWND) {
             // The outline extends past the glyphs on every side, so the box needs room for it.
             let outline = style.outline_width.clamp(0, MAX_OUTLINE_WIDTH);
 
-            let (box_x, box_y, box_w, box_h) = if style.fit_to_text {
-                let max_text_w = (region.width - pad_x * 2 - outline * 2).max(60);
-                let (tw, th) = measure_text_size(text.trim(), &style, max_text_w);
+            let (mut box_x, mut box_y, box_w, box_h) =
+                match (style.output_mode, style.output_region) {
+                    (OutputMode::Custom, Some(out)) if out.width >= 60 && out.height >= 32 => {
+                        if style.fit_to_text {
+                            let max_text_w = (out.width - pad_x * 2 - outline * 2).max(60);
+                            let (tw, th) = measure_text_size(text.trim(), &style, max_text_w);
+                            let bw = (tw + pad_x * 2 + 10 + outline * 2)
+                                .min(out.width)
+                                .max(60);
+                            let bh = (th + pad_y * 2 + 4 + outline * 2)
+                                .min(out.height)
+                                .max(32);
+                            let bx = out.left + (out.width - bw) / 2;
+                            let by = out.top + (out.height - bh) / 2;
+                            (bx, by, bw, bh)
+                        } else {
+                            (out.left, out.top, out.width, out.height)
+                        }
+                    }
+                    _ => {
+                        if style.fit_to_text {
+                            let max_text_w = (region.width - pad_x * 2 - outline * 2).max(60);
+                            let (tw, th) = measure_text_size(text.trim(), &style, max_text_w);
 
-                // Ensure the overlay box is at least large enough to fully cover the
-                // underlying source subtitle (e.g. 2-line EN under 1-line TR).
-                let (min_cover_w, min_cover_h, anchor_cx, anchor_cy) = match source_bounds {
-                    Some(sb) => (
-                        sb.width + 18,
-                        sb.height + 14,
-                        region.left + sb.x + sb.width / 2,
-                        region.top + sb.y + sb.height / 2,
-                    ),
-                    None => (
-                        0,
-                        0,
-                        region.left + region.width / 2,
-                        region.top + region.height / 2,
-                    ),
+                            // Ensure the overlay box is at least large enough to fully cover the
+                            // underlying source subtitle (e.g. 2-line EN under 1-line TR).
+                            let (min_cover_w, min_cover_h, anchor_cx, anchor_cy) =
+                                match source_bounds {
+                                    Some(sb) => (
+                                        sb.width + 18,
+                                        sb.height + 14,
+                                        region.left + sb.x + sb.width / 2,
+                                        region.top + sb.y + sb.height / 2,
+                                    ),
+                                    None => (
+                                        0,
+                                        0,
+                                        region.left + region.width / 2,
+                                        region.top + region.height / 2,
+                                    ),
+                                };
+
+                            let bw = (tw + pad_x * 2 + 10 + outline * 2)
+                                .max(min_cover_w)
+                                .min(region.width)
+                                .max(60);
+                            let bh = (th + pad_y * 2 + 4 + outline * 2)
+                                .max(min_cover_h)
+                                .min(region.height)
+                                .max(32);
+
+                            let max_x = (region.left + region.width - bw).max(region.left);
+                            let max_y = (region.top + region.height - bh).max(region.top);
+                            let bx = (anchor_cx - bw / 2).clamp(region.left, max_x);
+                            let by = (anchor_cy - bh / 2).clamp(region.top, max_y);
+                            (bx, by, bw, bh)
+                        } else {
+                            (region.left, region.top, region.width, region.height)
+                        }
+                    }
                 };
-
-                let bw = (tw + pad_x * 2 + 10 + outline * 2)
-                    .max(min_cover_w)
-                    .min(region.width)
-                    .max(60);
-                let bh = (th + pad_y * 2 + 4 + outline * 2)
-                    .max(min_cover_h)
-                    .min(region.height)
-                    .max(32);
-
-                let max_x = (region.left + region.width - bw).max(region.left);
-                let max_y = (region.top + region.height - bh).max(region.top);
-                let bx = (anchor_cx - bw / 2).clamp(region.left, max_x);
-                let by = (anchor_cy - bh / 2).clamp(region.top, max_y);
-                (bx, by, bw, bh)
-            } else {
-                (region.left, region.top, region.width, region.height)
-            };
+            box_x += style.offset_x;
+            box_y += style.offset_y;
 
             // Per-pixel-alpha frame: background opacity applies to the box only, text stays opaque.
             let frame = render_overlay(text.trim(), &style, box_w, box_h);
@@ -709,11 +743,22 @@ fn handle_toggle_pause(hwnd: HWND) -> bool {
 
 fn handle_reselect(hwnd: HWND) {
     let detected_app = foreground_process_name();
+    let guide_region = OVERLAY_HANDLE
+        .lock()
+        .ok()
+        .and_then(|g| {
+            let h = g.as_ref()?;
+            let st = h.state.lock().ok()?;
+            (st.region.width > 0 && st.region.height > 0).then_some(st.region)
+        });
     unsafe {
         let _ = ShowWindow(hwnd, SW_HIDE);
     }
 
-    match select_region() {
+    match select_region_with_options(SelectorOptions {
+        guide_region,
+        ..SelectorOptions::default()
+    }) {
         Ok(Some(new_region)) => {
             println!("[Region] New region: {:?}", new_region);
             match OVERLAY_HANDLE.lock() {
@@ -771,6 +816,103 @@ fn handle_reselect(hwnd: HWND) {
     apply_visibility_and_redraw(hwnd);
 }
 
+fn handle_select_output(hwnd: HWND) {
+    let (target_app, guide_region) = OVERLAY_HANDLE
+        .lock()
+        .ok()
+        .and_then(|g| {
+            let h = g.as_ref()?;
+            let target = h
+                .pending_output_target_app
+                .lock()
+                .ok()
+                .and_then(|mut t| t.take());
+            let guide = h.state.lock().ok().and_then(|st| {
+                let target_output = match target.as_deref() {
+                    Some(app) => st
+                        .config
+                        .profile_styles
+                        .get(app)
+                        .and_then(|s| s.output_region),
+                    None => st.config.output_region,
+                };
+                target_output
+                    .filter(|r| r.width > 0 && r.height > 0)
+                    .or_else(|| (st.region.width > 0 && st.region.height > 0).then_some(st.region))
+            });
+            Some((target, guide))
+        })
+        .unwrap_or((None, None));
+
+    unsafe {
+        let _ = ShowWindow(hwnd, SW_HIDE);
+    }
+
+    match select_region_with_options(SelectorOptions {
+        title: "Drag to select output subtitle area   (ESC or Right-Click to cancel)",
+        guide_region,
+        border_colorref: OUTPUT_BORDER_COLORREF,
+    }) {
+        Ok(Some(new_region)) => {
+            println!(
+                "[OutputRegion] New output region ({}): {:?}",
+                target_app.as_deref().unwrap_or("global"),
+                new_region
+            );
+            match OVERLAY_HANDLE.lock() {
+                Ok(guard) => match guard.as_ref() {
+                    Some(h) => match h.state.lock() {
+                        Ok(mut st) => {
+                            if let Some(ref app) = target_app {
+                                let base = OverlayStyle::from_config(&st.config);
+                                let entry = st
+                                    .config
+                                    .profile_styles
+                                    .entry(app.clone())
+                                    .or_insert(base);
+                                entry.output_mode = OutputMode::Custom;
+                                entry.output_region = Some(new_region);
+                                st.style = entry.clone();
+                            } else {
+                                st.config.output_mode = OutputMode::Custom;
+                                st.config.output_region = Some(new_region);
+                                st.style.output_mode = OutputMode::Custom;
+                                st.style.output_region = Some(new_region);
+                            }
+                            h.save_config_or_notice(&st.config);
+                        }
+                        Err(e) => h.push_notice(
+                            NoticeLevel::Error,
+                            "region",
+                            format!(
+                                "Could not update output region because overlay state is locked: {e}"
+                            ),
+                        ),
+                    },
+                    None => eprintln!(
+                        "[OutputRegion ERROR] Overlay handle is unavailable after selection"
+                    ),
+                },
+                Err(e) => eprintln!("[OutputRegion ERROR] Could not access overlay handle: {e}"),
+            }
+        }
+        Ok(None) => println!("[OutputRegion] Selection cancelled or too small; config unchanged"),
+        Err(e) => {
+            eprintln!("[OutputRegion ERROR] Selector failed: {e}");
+            if let Ok(guard) = OVERLAY_HANDLE.lock() {
+                if let Some(h) = guard.as_ref() {
+                    h.push_notice(
+                        NoticeLevel::Error,
+                        "region",
+                        format!("Output region selector failed: {e}"),
+                    );
+                }
+            }
+        }
+    }
+    apply_visibility_and_redraw(hwnd);
+}
+
 fn handle_open_gui() {
     if let Ok(guard) = OVERLAY_HANDLE.lock() {
         if let Some(h) = guard.as_ref() {
@@ -793,6 +935,10 @@ unsafe extern "system" fn overlay_wnd_proc(
         }
         WM_APP_RESELECT => {
             handle_reselect(hwnd);
+            LRESULT(0)
+        }
+        WM_APP_SELECT_OUTPUT => {
+            handle_select_output(hwnd);
             LRESULT(0)
         }
         WM_APP_TOGGLE_PAUSE => {
@@ -949,6 +1095,7 @@ pub fn create_handle(config: AppConfig, region: Region) -> OverlayHandle {
         history: Arc::new(Mutex::new(crate::history::HistoryBuffer::default())),
         history_visible: Arc::new(AtomicBool::new(false)),
         history_turkish: Arc::new(AtomicBool::new(false)),
+        pending_output_target_app: Arc::new(Mutex::new(None)),
         notices: Arc::new(Mutex::new(VecDeque::with_capacity(MAX_NOTICES))),
         next_notice_id: Arc::new(AtomicU64::new(0)),
     }

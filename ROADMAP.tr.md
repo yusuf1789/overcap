@@ -80,6 +80,17 @@ Ağ kesilip gelmesi, bilgisayarın uykudan dönmesi, çözünürlük/DPI değiş
 
 **Kabul ölçütleri:** Tek/çok konuşmacılı replikler, etiketsiz diyalog, hitap edilen isimler, OCR hatalı etiketler, görev başlıkları ve bozuk yanıtlar denenir. Etiketler iki kez çizilmez; diyalog sırası ve metni korunur. Kalite ve gecikme karşılaştırması yapılmadan özelliğin hız veya doğruluk kazancı varsayılmaz.
 
+## 8. İsteğe Bağlı Sahne İçi Altyazı Dışı Metin Filtreleme (HUD ve Tabelalar)
+
+**Durum: Fikir; henüz uygulanmadı.**
+
+Altyazı yakalama şeridi oyun içi tabelalar, yüzen HUD uyarıları veya arka plan yazılarıyla çakıştığında OCR altyazı dışındaki metinleri de okuyabilir. İsteğe bağlı bir filtre, metni çeviriye göndermeden önce parlaklık ve satır yüksekliği ölçütleriyle ön elemeden geçirebilir.
+
+- Aday OCR satırlarını minimum parlaklık/parlak piksel oranı ve baskın altyazı boyutuna göre beklenen satır yüksekliği aralığıyla süzmek; özelliği varsayılan olarak kapalı ve isteğe bağlı tutmak.
+- Sabit koordinat veya oyuna özel kural eklemeden oyun-bağımsız sezgisel ölçütleri korumak.
+
+**Kabul ölçütü:** Gerçek diyalog satırlarını, tek kelimelik yanıtları veya italik/daha sönük konuşmacı ipuçlarını kaybetmeden sönük/küçük arka plan tabelalarını ve farklı ölçekteki HUD etiketlerini eleyebilmek.
+
 ## Uygulama Sırası ve Ortak Kurallar
 
 Çeviri geçmişi tamamlandı. Kalan maddelerde önce pencere takibi, ardından replik senkronizasyonu önerilir. Diğer maddeler gerçek kullanımdan gelen ihtiyaçlara göre sıralanabilir.

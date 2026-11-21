@@ -80,6 +80,17 @@ The translation model could return the speaker label and translated dialogue in 
 
 **Acceptance criteria:** Test single/multiple speakers, unlabelled dialogue, names used as an address, OCR-damaged labels, mission headings, and malformed responses. Do not duplicate labels or change dialogue order/content. Do not assume a speed or accuracy improvement before measuring quality and latency.
 
+## 8. Optional In-Scene Non-Subtitle Text Filtering (HUD & Signs)
+
+**Status: Idea; not implemented yet.**
+
+When subtitles overlap with world signs, floating HUD prompts, or background labels inside the capture strip, OCR can accidentally pick up non-subtitle text. An optional filter can pre-screen OCR lines using brightness and glyph-height heuristics before sending text to translation.
+
+- Filter candidate OCR lines by minimum bright-pixel ratio/luminance and expected line height relative to the dominant subtitle text, keeping the filter strictly optional and off by default.
+- Preserve game-independent heuristics without fixed coordinates or title-specific rules.
+
+**Acceptance criteria:** Reject dim/tiny background signs and off-scale HUD tags without dropping legitimate dialogue lines, single-word replies, or italic/dimmed speaker cues.
+
 ## Suggested Order and Shared Rules
 
 Translation history is complete. For the remaining items, start with window tracking, then subtitle synchronization. Prioritize the remaining ideas according to actual usage.

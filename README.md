@@ -3,6 +3,7 @@
 [Türkçe dokümantasyon için README.tr.md](README.tr.md)
 
 [Improvement ideas and roadmap](ROADMAP.md)
+- **Roadmap highlight:** Optional in-scene non-subtitle text filtering (HUD/sign brightness & height filtering) — see [ROADMAP.md](ROADMAP.md).
 
 General-purpose, low-latency live game and video subtitle translator overlay for Windows.
 
@@ -19,9 +20,9 @@ Works game-independently with PC games (Borderless Windowed), console streaming/
   - The overlay window is visible to the user but invisible to screen capture APIs, allowing OCR to continuously read the original subtitle underneath without self-capture loops.
   - Uses `WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW` so mouse clicks pass through to the game, focus is never stolen, and the window stays hidden from Alt+Tab.
   - Automatically hides when the source subtitle disappears.
-- **OCR Bounding Box Cover & Auto-Fit:**
-  - Computes the actual pixel bounds of the source subtitle from `OcrWord.BoundingRect`.
-  - Guarantees full coverage of the underlying text (even when a 2-line source translates to 1 line) while keeping short lines compact without wide black bars.
+- **OCR Bounding Box Cover & Flexible Overlay Placement:**
+  - Computes the actual pixel bounds of the source subtitle from `OcrWord.BoundingRect` (`Cover Original` mode) to guarantee full coverage of the underlying text even when a 2-line source translates to 1 line, while keeping short lines compact with `Auto-Fit Container`.
+  - Supports **Custom Output Area** (`Custom Area`) to render translations in a separate screen rectangle (with an amber selector, live dimension readout, and gray guide frame), plus **Offset X & Y** pixel adjustments per global or app style.
 - **Smart Change Detection & Deduplication:**
   - Bright-pixel change mask (`luma >= 170`) prevents unnecessary OCR triggers from background camera motion.
   - Levenshtein similarity + word-overlap deduplication avoids redundant API calls and overlay flicker on noisy OCR frames.

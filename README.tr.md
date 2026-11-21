@@ -3,6 +3,7 @@
 [English documentation: README.md](README.md)
 
 [Geliştirme fikirleri ve yol haritası](ROADMAP.tr.md)
+- **Yol haritası öne çıkanı:** İsteğe bağlı sahne içi altyazı dışı metin filtreleme (HUD/tabela parlaklık ve satır yüksekliği filtresi) — bkz. [ROADMAP.tr.md](ROADMAP.tr.md).
 
 Windows için genel amaçlı, düşük gecikmeli canlı oyun ve video altyazı çevirici.
 
@@ -19,9 +20,9 @@ Herhangi bir PC oyunu (Borderless Windowed), konsol ekran aktarımı (Xbox Remot
   - Overlay penceresi kullanıcıya görünür, ancak ekran yakalayıcıya karşı görünmezdir; bu sayede OCR alttaki orijinal altyazıyı kesintisiz okumaya devam eder.
   - `WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW` ile tıklamaları alttaki oyuna geçirir, odak çalmaz ve Alt+Tab listesinde görünmez.
   - Altyazı kaybolduğunda otomatik gizlenir.
-- **OCR Bounding Box Örtme & Auto-Fit:**
-  - `OcrWord.BoundingRect` koordinatlarıyla alttaki orijinal altyazının gerçek piksel alanını hesaplar.
-  - Orijinal altyazı 2 satır, çeviri 1 satır olsa bile alttaki metni tamamen kapatır; kısa cümlelerde gereksiz siyah şerit bırakmaz.
+- **OCR Bounding Box Örtme & Esnek Overlay Konumlandırma:**
+  - `OcrWord.BoundingRect` koordinatlarıyla alttaki orijinal altyazının gerçek piksel alanını hesaplar (`Orijinali Kapat` / `Cover Original`), orijinal altyazı 2 satır ve çeviri 1 satır olsa bile alttaki metni tamamen kapatır; kısa cümlelerde `Auto-Fit Container` ile gereksiz siyah şerit bırakmaz.
+  - Çeviriyi ayrı bir ekranda belirlenen alana yerleştirmek için **Özel Çıktı Alanı** (`Custom Area` — canlı boyut göstergeli kehribar seçici ve gri kılavuz çerçeve) ve global veya uygulama profili bazında **Offset X & Y** piksel kaydırma desteği sunar.
 - **Akıllı Değişim ve Tekrar Filtresi:**
   - Parlak piksel maskesi (`luma >= 170`) ile kamera/arka plan hareketlerinde gereksiz OCR tetiklenmesini engeller.
   - Levenshtein + kelime örtüşmesi (word-overlap) ile gürültülü OCR karelerinde aynı cümleyi tekrar API'ye göndermez ve ekranda titreme yapmaz.

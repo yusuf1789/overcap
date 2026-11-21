@@ -15,6 +15,15 @@ pub struct Region {
 /// Largest supported text outline width in pixels.
 pub const MAX_OUTLINE_WIDTH: i32 = 6;
 
+/// Where the translated subtitle overlay is placed relative to the captured subtitle.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum OutputMode {
+    #[default]
+    Cover,
+    Custom,
+}
+
 /// Everything that controls how the translated subtitle looks. Used live by the overlay,
 /// and stored per app in `AppConfig::profile_styles`. Missing fields fall back to defaults,
 /// so hand-edited or older entries keep loading.
@@ -35,6 +44,14 @@ pub struct OverlayStyle {
     pub padding_y: i32,
     pub outline_width: i32,
     pub outline_color: String,
+    #[serde(default)]
+    pub output_mode: OutputMode,
+    #[serde(default)]
+    pub output_region: Option<Region>,
+    #[serde(default)]
+    pub offset_x: i32,
+    #[serde(default)]
+    pub offset_y: i32,
 }
 
 impl Default for OverlayStyle {
@@ -59,6 +76,10 @@ impl OverlayStyle {
             padding_y: cfg.padding_y,
             outline_width: cfg.outline_width,
             outline_color: cfg.outline_color.clone(),
+            output_mode: cfg.output_mode,
+            output_region: cfg.output_region,
+            offset_x: cfg.offset_x,
+            offset_y: cfg.offset_y,
         }
     }
 
@@ -77,6 +98,10 @@ impl OverlayStyle {
         cfg.padding_y = self.padding_y;
         cfg.outline_width = self.outline_width;
         cfg.outline_color = self.outline_color.clone();
+        cfg.output_mode = self.output_mode;
+        cfg.output_region = self.output_region;
+        cfg.offset_x = self.offset_x;
+        cfg.offset_y = self.offset_y;
     }
 }
 
@@ -139,6 +164,14 @@ pub struct AppConfig {
     /// Capture the target window via WGC and allow the overlay to appear in Discord/OBS screen share.
     #[serde(default)]
     pub stream_mode: bool,
+    #[serde(default)]
+    pub output_mode: OutputMode,
+    #[serde(default)]
+    pub output_region: Option<Region>,
+    #[serde(default)]
+    pub offset_x: i32,
+    #[serde(default)]
+    pub offset_y: i32,
 }
 
 fn default_font_family() -> String {
@@ -256,6 +289,10 @@ impl Default for AppConfig {
             profiles: HashMap::new(),
             profile_styles: HashMap::new(),
             stream_mode: false,
+            output_mode: OutputMode::default(),
+            output_region: None,
+            offset_x: 0,
+            offset_y: 0,
         }
     }
 }
@@ -617,6 +654,72 @@ mod tests {
         let cfg = AppConfig::load_from(&path);
         assert_eq!(cfg.font_size, 33);
         assert!(!dir.join("config.json.bak").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn placement_fields_are_backward_compatible_and_roundtrip() {
+        let dir = temp_dir("placement");
+        let path = dir.join("config.json");
+
+        // Old config without output_mode, output_region, offset_x, offset_y.
+        fs::write(
+            &path,
+            r##"{"font_size": 28, "profile_styles": {"game.exe": {"font_size": 34}}}"##,
+        )
+        .unwrap();
+        let (old_cfg, notice) = AppConfig::load_checked(&path);
+        assert!(notice.is_none());
+        assert_eq!(old_cfg.output_mode, OutputMode::Cover);
+        assert!(old_cfg.output_region.is_none());
+        assert_eq!(old_cfg.offset_x, 0);
+        assert_eq!(old_cfg.offset_y, 0);
+        let old_app_style = &old_cfg.profile_styles["game.exe"];
+        assert_eq!(old_app_style.output_mode, OutputMode::Cover);
+        assert!(old_app_style.output_region.is_none());
+        assert_eq!(old_app_style.offset_x, 0);
+        assert_eq!(old_app_style.offset_y, 0);
+
+        // Roundtrip with Custom output_region and offsets (global + per-app).
+        let custom_region = Region {
+            left: 480,
+            top: 820,
+            width: 960,
+            height: 110,
+        };
+        let app_region = Region {
+            left: 120,
+            top: 700,
+            width: 800,
+            height: 90,
+        };
+        let mut cfg = AppConfig::default();
+        cfg.output_mode = OutputMode::Custom;
+        cfg.output_region = Some(custom_region);
+        cfg.offset_x = -24;
+        cfg.offset_y = 36;
+        cfg.profile_styles.insert(
+            "player.exe".to_string(),
+            OverlayStyle {
+                output_mode: OutputMode::Custom,
+                output_region: Some(app_region),
+                offset_x: 15,
+                offset_y: -40,
+                ..OverlayStyle::default()
+            },
+        );
+        cfg.save_to(&path).unwrap();
+
+        let loaded = AppConfig::load_from(&path);
+        assert_eq!(loaded.output_mode, OutputMode::Custom);
+        assert_eq!(loaded.output_region, Some(custom_region));
+        assert_eq!(loaded.offset_x, -24);
+        assert_eq!(loaded.offset_y, 36);
+        let loaded_app = &loaded.profile_styles["player.exe"];
+        assert_eq!(loaded_app.output_mode, OutputMode::Custom);
+        assert_eq!(loaded_app.output_region, Some(app_region));
+        assert_eq!(loaded_app.offset_x, 15);
+        assert_eq!(loaded_app.offset_y, -40);
         let _ = fs::remove_dir_all(&dir);
     }
 }

@@ -8,8 +8,10 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::config::{AppConfig, OverlayStyle, MAX_OUTLINE_WIDTH};
-use crate::ocr::{available_ocr_languages, is_language_installed};
+use crate::config::{AppConfig, OutputMode, OverlayStyle, MAX_OUTLINE_WIDTH};
+use crate::ocr::{
+    available_ocr_languages, is_language_installed, launch_ocr_pack_installer, ocr_capability_name,
+};
 use crate::overlay::{NoticeLevel, OverlayHandle};
 use crate::tray;
 
@@ -69,6 +71,7 @@ enum Tab {
     Engine,
     ProfilesOcr,
     LiveLog,
+    Setup,
 }
 
 #[derive(Clone, Copy)]
@@ -415,11 +418,17 @@ impl OvercapApp {
         let installed_ocr_langs = available_ocr_languages();
         let source_ocr_installed = is_language_installed(&cfg.source_lang);
 
+        let initial_tab = if cfg.region.is_none() {
+            Tab::Setup
+        } else {
+            Tab::Appearance
+        };
+
         Self {
             handle,
             theme: ThemeMode::Dark,
             ui_lang: UiLang::En,
-            active_tab: Tab::Appearance,
+            active_tab: initial_tab,
             stage_bg: StageBg::Dark,
             sample_idx: 0,
             overlay_preview_on: false,
@@ -575,6 +584,10 @@ impl OvercapApp {
             padding_y: py,
             outline_width: outline,
             outline_color: "#000000".to_string(),
+            output_mode: self.style.output_mode,
+            output_region: self.style.output_region,
+            offset_x: self.style.offset_x,
+            offset_y: self.style.offset_y,
         };
         self.commit_style();
     }
@@ -953,7 +966,12 @@ impl OvercapApp {
                     self.t("Profiles & OCR", "Profiller & OCR"),
                 ),
                 (Tab::LiveLog, self.t("Live Log", "Canli Kayit")),
+                (Tab::Setup, self.t("Setup", "Kurulum")),
             ];
+
+            let region = self.handle.current_region();
+            let setup_needs_attention =
+                !self.source_ocr_installed || region.width < 60 || region.height < 32;
 
             for (tab, label) in tabs {
                 let active = self.active_tab == tab;
@@ -966,6 +984,13 @@ impl OvercapApp {
                 let resp = ui.add(egui::Label::new(text).sense(Sense::click()));
                 if resp.clicked() {
                     self.active_tab = tab;
+                    if tab == Tab::Setup {
+                        self.refresh_ocr_diagnostics();
+                    }
+                }
+                if tab == Tab::Setup && setup_needs_attention {
+                    let dot_center = egui::pos2(resp.rect.right() + 5.0, resp.rect.center().y);
+                    ui.painter().circle_filled(dot_center, 3.0, pal.status_amber);
                 }
                 if active {
                     let y = resp.rect.bottom() + 4.0;
@@ -1250,6 +1275,111 @@ impl OvercapApp {
                                 .changed();
                         });
                     }
+                });
+
+                ui.add_space(10.0);
+                section_header(ui, pal, tr(lang, "Placement", "Konumlandirma"));
+
+                ui.horizontal(|ui| {
+                    row_label(ui, tr(lang, "Output Mode", "Cikti Modu"));
+                    for (mode, label) in [
+                        (
+                            OutputMode::Cover,
+                            tr(lang, "Cover Original", "Orijinali Kapat"),
+                        ),
+                        (OutputMode::Custom, tr(lang, "Custom Area", "Ozel Alan")),
+                    ] {
+                        let selected = self.style.output_mode == mode;
+                        let btn =
+                            egui::Button::new(RichText::new(label).size(11.5).color(if selected {
+                                pal.accent_text
+                            } else {
+                                pal.text_primary
+                            }))
+                            .fill(if selected { pal.accent } else { pal.input_bg });
+                        if ui.add(btn).clicked() && self.style.output_mode != mode {
+                            self.style.output_mode = mode;
+                            changed = true;
+                        }
+                    }
+                });
+
+                if self.style.output_mode == OutputMode::Custom {
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        row_label(ui, tr(lang, "Output Area", "Cikti Alani"));
+                        let area_text = match self.style.output_region {
+                            Some(r) => format!("{}x{} @ {},{}", r.width, r.height, r.left, r.top),
+                            None => tr(lang, "Not set", "Secilmedi").to_string(),
+                        };
+                        ui.label(
+                            RichText::new(area_text)
+                                .font(FontId::new(12.0, FontFamily::Monospace))
+                                .color(if self.style.output_region.is_some() {
+                                    pal.text_primary
+                                } else {
+                                    pal.status_amber
+                                }),
+                        );
+                        ui.add_space(6.0);
+                        if ui
+                            .button(tr(lang, "Select Output Area", "Cikti Alani Sec"))
+                            .clicked()
+                        {
+                            self.handle.trigger_select_output(self.editing_app.clone());
+                        }
+                        if ui
+                            .add_enabled(
+                                self.style.output_region.is_some(),
+                                egui::Button::new(tr(lang, "Clear", "Temizle")),
+                            )
+                            .clicked()
+                        {
+                            self.style.output_region = None;
+                            changed = true;
+                        }
+                    });
+                }
+
+                ui.add_space(4.0);
+                ui.columns(2, |cols| {
+                    changed |= slider_row(
+                        &mut cols[0],
+                        pal,
+                        tr(lang, "Offset X", "Offset X"),
+                        &mut self.style.offset_x,
+                        -300..=300,
+                        |v| format!("{v} px"),
+                    );
+                    cols[1].horizontal(|ui| {
+                        row_label(ui, tr(lang, "Offset Y", "Offset Y"));
+                        ui.spacing_mut().slider_width = 150.0;
+                        changed |= ui
+                            .add(
+                                egui::Slider::new(&mut self.style.offset_y, -300..=300)
+                                    .show_value(false),
+                            )
+                            .changed();
+                        ui.add_sized(
+                            [56.0, 20.0],
+                            egui::Label::new(
+                                RichText::new(format!("{} px", self.style.offset_y))
+                                    .font(FontId::new(12.0, FontFamily::Monospace))
+                                    .color(pal.text_muted),
+                            ),
+                        );
+                        if ui
+                            .add_enabled(
+                                self.style.offset_x != 0 || self.style.offset_y != 0,
+                                egui::Button::new(tr(lang, "Reset", "Sifirla")),
+                            )
+                            .clicked()
+                        {
+                            self.style.offset_x = 0;
+                            self.style.offset_y = 0;
+                            changed = true;
+                        }
+                    });
                 });
             });
 
@@ -1969,6 +2099,313 @@ impl OvercapApp {
                     });
             });
     }
+
+    fn render_setup_tab(&mut self, ui: &mut egui::Ui, pal: Palette) {
+        let cfg = self.handle.snapshot_config();
+        let region = self.handle.current_region();
+        let region_ok = region.width >= 60 && region.height >= 32;
+        let cap_opt = ocr_capability_name(&cfg.source_lang);
+
+        let engine_label = cfg.engine.to_lowercase();
+        let engine_has_key = match engine_label.as_str() {
+            "groq" => key_available(cfg.groq_api_key.as_deref(), "GROQ_API_KEY"),
+            "gemini" => key_available(cfg.gemini_api_key.as_deref(), "GEMINI_API_KEY"),
+            "openai-compat" | "custom" | "ollama" => true,
+            _ => true, // Google keyless
+        };
+        let is_google_only = engine_label == "google";
+
+        // Step 1: Windows OCR Language Pack
+        Frame::none()
+            .fill(pal.surface_bg)
+            .stroke(Stroke::new(1.0_f32, pal.border))
+            .rounding(Rounding::same(4.0))
+            .inner_margin(Margin::symmetric(12.0, 10.0))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    let (badge, badge_col) = if self.source_ocr_installed {
+                        ("[OK]", pal.status_green)
+                    } else {
+                        ("[MISSING]", pal.status_red)
+                    };
+                    ui.label(
+                        RichText::new(badge)
+                            .font(FontId::new(12.0, FontFamily::Monospace))
+                            .strong()
+                            .color(badge_col),
+                    );
+                    ui.label(
+                        RichText::new(format!(
+                            "1. {} ({})",
+                            self.t("Windows OCR Language Pack", "Windows OCR Dil Paketi"),
+                            cfg.source_lang
+                        ))
+                        .strong()
+                        .size(13.0)
+                        .color(pal.text_primary),
+                    );
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui.button(self.t("Recheck", "Tekrar Kontrol")).clicked() {
+                            self.refresh_ocr_diagnostics();
+                        }
+                    });
+                });
+                ui.add_space(5.0);
+                ui.label(
+                    RichText::new(self.t(
+                        "Required for accurate subtitle reading. Does not change your Windows display language (1 MB OCR capability only).",
+                        "Altyazilarin hatasiz okunmasi icin gereklidir. Windows goruntuleme dilini degistirmez (sadece 1 MB OCR ozelligi).",
+                    ))
+                    .size(11.5)
+                    .color(pal.text_muted),
+                );
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if let Some(cap) = cap_opt {
+                        let install_btn = egui::Button::new(
+                            RichText::new(self.t(
+                                "Install OCR Pack (Admin)",
+                                "OCR Paketini Kur (Yonetici)",
+                            ))
+                            .color(if !self.source_ocr_installed {
+                                pal.accent_text
+                            } else {
+                                pal.text_primary
+                            }),
+                        )
+                        .fill(if !self.source_ocr_installed {
+                            pal.accent
+                        } else {
+                            pal.input_bg
+                        });
+                        if ui.add(install_btn).clicked() {
+                            if let Err(e) = launch_ocr_pack_installer(cap) {
+                                self.handle.push_notice(
+                                    NoticeLevel::Error,
+                                    "ocr",
+                                    format!("Could not launch OCR installer: {e}"),
+                                );
+                            }
+                        }
+                    }
+                    if ui
+                        .button(self.t("Open Windows Settings", "Windows Ayarlarini Ac"))
+                        .clicked()
+                    {
+                        let _ = Command::new("cmd")
+                            .args(["/C", "start", "", "ms-settings:regionlanguage"])
+                            .spawn();
+                    }
+                    let installed = if self.installed_ocr_langs.is_empty() {
+                        "-".to_string()
+                    } else {
+                        self.installed_ocr_langs.join(", ")
+                    };
+                    ui.label(
+                        RichText::new(format!("Installed: {installed}"))
+                            .font(FontId::new(11.5, FontFamily::Monospace))
+                            .color(pal.text_muted),
+                    );
+                });
+            });
+
+        ui.add_space(8.0);
+
+        // Step 2: Subtitle Capture Region
+        Frame::none()
+            .fill(pal.surface_bg)
+            .stroke(Stroke::new(1.0_f32, pal.border))
+            .rounding(Rounding::same(4.0))
+            .inner_margin(Margin::symmetric(12.0, 10.0))
+            .show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    let (badge, badge_col) = if region_ok {
+                        ("[OK]", pal.status_green)
+                    } else {
+                        ("[MISSING]", pal.status_red)
+                    };
+                    ui.label(
+                        RichText::new(badge)
+                            .font(FontId::new(12.0, FontFamily::Monospace))
+                            .strong()
+                            .color(badge_col),
+                    );
+                    ui.label(
+                        RichText::new(self.t(
+                            "2. Subtitle Capture Region",
+                            "2. Altyazi Yakalama Bolgesi",
+                        ))
+                        .strong()
+                        .size(13.0)
+                        .color(pal.text_primary),
+                    );
+                });
+                ui.add_space(5.0);
+                ui.horizontal(|ui| {
+                    let sel_btn = egui::Button::new(
+                        RichText::new(self.t(
+                            "Select Region (Ctrl+Shift+S)",
+                            "Bolge Sec (Ctrl+Shift+S)",
+                        ))
+                        .color(if !region_ok {
+                            pal.accent_text
+                        } else {
+                            pal.text_primary
+                        }),
+                    )
+                    .fill(if !region_ok {
+                        pal.accent
+                    } else {
+                        pal.input_bg
+                    });
+                    if ui.add(sel_btn).clicked() {
+                        self.handle.trigger_reselect();
+                    }
+                    let reg_txt = if region_ok {
+                        format!(
+                            "{}x{} @ {},{}",
+                            region.width, region.height, region.left, region.top
+                        )
+                    } else {
+                        self.t("Not selected yet", "Henuz secilmedi").to_string()
+                    };
+                    ui.label(
+                        RichText::new(reg_txt)
+                            .font(FontId::new(11.5, FontFamily::Monospace))
+                            .color(pal.text_muted),
+                    );
+                });
+            });
+
+        ui.add_space(8.0);
+
+        // Step 3: Translation Engine (Optional Speed Upgrade)
+        Frame::none()
+            .fill(pal.surface_bg)
+            .stroke(Stroke::new(1.0_f32, pal.border))
+            .rounding(Rounding::same(4.0))
+            .inner_margin(Margin::symmetric(12.0, 10.0))
+            .show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    let (badge, badge_col) = if !engine_has_key {
+                        ("[KEY MISSING]", pal.status_amber)
+                    } else if is_google_only {
+                        ("[READY]", pal.status_green)
+                    } else {
+                        ("[OK]", pal.status_green)
+                    };
+                    ui.label(
+                        RichText::new(badge)
+                            .font(FontId::new(12.0, FontFamily::Monospace))
+                            .strong()
+                            .color(badge_col),
+                    );
+                    ui.label(
+                        RichText::new(format!(
+                            "3. {} ({})",
+                            self.t("Translation Engine", "Ceviri Motoru"),
+                            cfg.engine
+                        ))
+                        .strong()
+                        .size(13.0)
+                        .color(pal.text_primary),
+                    );
+                });
+                ui.add_space(5.0);
+                ui.label(
+                    RichText::new(self.t(
+                        "Google Translate works immediately with no key (~300-600 ms). For ~180 ms natural game/slang translation, get a free Groq API key and paste it in the Engine tab.",
+                        "Google Translate anahtarsiz aninda calisir (~300-600 ms). ~180 ms hiz ve dogal oyun/argo cevirisi icin ucretsiz Groq anahtari alip Motor sekmesine yapistirin.",
+                    ))
+                    .size(11.5)
+                    .color(pal.text_muted),
+                );
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .button(self.t("Get Free Groq Key", "Ucretsiz Groq Anahtari Al"))
+                        .clicked()
+                    {
+                        let _ = Command::new("cmd")
+                            .args(["/C", "start", "", "https://console.groq.com/keys"])
+                            .spawn();
+                    }
+                    if ui
+                        .button(self.t("Get Gemini Key", "Gemini Anahtari Al"))
+                        .clicked()
+                    {
+                        let _ = Command::new("cmd")
+                            .args(["/C", "start", "", "https://aistudio.google.com/apikey"])
+                            .spawn();
+                    }
+                    if ui
+                        .button(self.t("Open Engine Tab", "Motor Sekmesini Ac"))
+                        .clicked()
+                    {
+                        self.active_tab = Tab::Engine;
+                    }
+                });
+            });
+
+        ui.add_space(8.0);
+
+        // Step 4: Game & Stream Checklist
+        Frame::none()
+            .fill(pal.surface_bg)
+            .stroke(Stroke::new(1.0_f32, pal.border))
+            .rounding(Rounding::same(4.0))
+            .inner_margin(Margin::symmetric(12.0, 10.0))
+            .show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("[INFO]")
+                            .font(FontId::new(12.0, FontFamily::Monospace))
+                            .strong()
+                            .color(pal.text_muted),
+                    );
+                    ui.label(
+                        RichText::new(self.t(
+                            "4. Game & Discord Stream Checklist",
+                            "4. Oyun ve Discord Yayin Kontrol Listesi",
+                        ))
+                        .strong()
+                        .size(13.0)
+                        .color(pal.text_primary),
+                    );
+                });
+                ui.add_space(5.0);
+                for (en, tr_txt) in [
+                    (
+                        "- Display mode: set games to Borderless Windowed (Exclusive Fullscreen hides desktop overlays).",
+                        "- Goruntu modu: oyunlari Borderless Windowed (Cercevesiz Tam Ekran) yapin.",
+                    ),
+                    (
+                        "- In-game subtitles: enable Subtitle Background (Dark) if available for higher OCR accuracy.",
+                        "- Oyun ici altyazi: mumkunse koyu altyazi arka planini (Subtitle Background) acin.",
+                    ),
+                    (
+                        "- Discord / OBS stream: enable Stream Mode in Profiles & OCR, then share Screen (not Application).",
+                        "- Discord / OBS yayini: Profiller & OCR altindan Stream Mode acin ve Uygulama degil Ekran paylasin.",
+                    ),
+                ] {
+                    ui.label(
+                        RichText::new(self.t(en, tr_txt))
+                            .size(11.5)
+                            .color(pal.text_muted),
+                    );
+                }
+                ui.add_space(6.0);
+                if ui
+                    .button(self.t("Open Profiles & Stream", "Profiller ve Stream Ac"))
+                    .clicked()
+                {
+                    self.active_tab = Tab::ProfilesOcr;
+                }
+            });
+    }
 }
 
 impl eframe::App for OvercapApp {
@@ -2045,6 +2482,7 @@ impl eframe::App for OvercapApp {
                         Tab::Engine => self.render_engine_tab(ui, pal),
                         Tab::ProfilesOcr => self.render_profiles_ocr_tab(ui, pal),
                         Tab::LiveLog => self.render_live_log_tab(ui, pal),
+                        Tab::Setup => self.render_setup_tab(ui, pal),
                     });
             });
 

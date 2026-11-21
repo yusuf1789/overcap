@@ -16,6 +16,13 @@ The canonical version number is maintained in `package.version` inside [Cargo.to
 
 ## Changelog
 
+### `v0.4.6` — Overlay Placement & Built-In Setup Tab
+- Added a `Setup` (`Kurulum`) tab with live requirement checks (`[OK]` / `[MISSING]` / `[READY]`), one-click elevated Windows OCR language pack installer (`Add-WindowsCapability`), direct region selection, quick Groq/Gemini key links, and a Game & Discord Stream checklist. First-time launches with no saved region open directly on `Setup`.
+- Added flexible overlay placement settings (`output_mode`: `cover` | `custom`, `output_region`, `offset_x`, `offset_y`) to both global style and per-app `profile_styles` in `config.json` with backward-compatible defaults.
+- **Cover Original** keeps `SourceBounds`-based coverage directly over the original subtitle and applies optional `Offset X/Y` shifts (`-300..=300 px`).
+- **Custom Area** renders translations inside a dedicated user-selected output region (using an amber selector with live `W x H @ X, Y` dimension readout and a subtle gray guide frame for the existing capture/output region) without enforcing source-text coverage.
+- Added the `Placement` section to the `Appearance` tab (`Output Mode`, `Select Output Area`, `Clear`, `Offset X/Y`, `Reset`), respecting `Global` vs per-app scope and `EN`/`TR` labels.
+
 ### `v0.4.5` — Stream Mode (Windows Graphics Capture)
 - Added optional **Stream Mode (Discord / OBS)** in `Profiles & OCR` (`stream_mode` in `config.json`, default `false`).
 - Implemented GPU window capture in `src/wgc.rs` using Windows Graphics Capture (`GraphicsCaptureItem::CreateForWindow`, `Direct3D11CaptureFramePool::CreateFreeThreaded`, `IsBorderRequired(false)` on Windows 11) so only the target game/app window is captured.
